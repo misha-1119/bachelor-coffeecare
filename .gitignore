@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.env
+.env.local
+node_modules/
+.convex/
+convex/_generated/
+*.log
+.DS_Store
+data/manuals/**/*.pdf
+data/manuals/_parsed/
+/.claude

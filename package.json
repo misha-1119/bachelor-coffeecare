@@ -1,0 +1,13 @@
+{
+  "name": "diploma_caffebot",
+  "version": "1.0.0",
+  "description": "Intelligent technical support assistant based on NLP",
+  "private": true,
+  "scripts": {
+    "convex:dev": "convex dev",
+    "convex:deploy": "convex deploy"
+  },
+  "dependencies": {
+    "convex": "^1.37.0"
+  }
+}

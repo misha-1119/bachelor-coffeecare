@@ -1,0 +1,177 @@
+[
+  {
+    "id": "test_001",
+    "query": "У мене горить помилка E01 на дисплеї",
+    "expected_category": "error_code",
+    "expected_kb_id": "kb_001",
+    "relevant_keywords": ["E01"]
+  },
+  {
+    "id": "test_002",
+    "query": "Машина показує E02 і не працює",
+    "expected_category": "error_code",
+    "expected_kb_id": "kb_002",
+    "relevant_keywords": ["E02"]
+  },
+  {
+    "id": "test_003",
+    "query": "Кава дуже слабка і водяниста, що не так?",
+    "expected_category": "brewing",
+    "expected_kb_id": "kb_011",
+    "relevant_keywords": ["слабка", "водяниста"]
+  },
+  {
+    "id": "test_004",
+    "query": "Як часто треба чистити машину від накипу?",
+    "expected_category": "cleaning",
+    "expected_kb_id": "kb_006",
+    "relevant_keywords": ["накип", "декальцинація"]
+  },
+  {
+    "id": "test_005",
+    "query": "Кавомашина взагалі не вмикається",
+    "expected_category": "maintenance",
+    "expected_kb_id": "kb_018",
+    "relevant_keywords": ["не вмикається"]
+  },
+  {
+    "id": "test_006",
+    "query": "Вода витікає з-під машини",
+    "expected_category": "water_system",
+    "expected_kb_id": "kb_015",
+    "relevant_keywords": ["витікає", "протікає"]
+  },
+  {
+    "id": "test_007",
+    "query": "На каві немає пінки взагалі",
+    "expected_category": "brewing",
+    "expected_kb_id": "kb_013",
+    "relevant_keywords": ["пінка", "крема"]
+  },
+  {
+    "id": "test_008",
+    "query": "Помилка E03 - що це означає?",
+    "expected_category": "error_code",
+    "expected_kb_id": "kb_003",
+    "relevant_keywords": ["E03"]
+  },
+  {
+    "id": "test_009",
+    "query": "Як змінити водяний фільтр?",
+    "expected_category": "water_system",
+    "expected_kb_id": "kb_016",
+    "relevant_keywords": ["фільтр"]
+  },
+  {
+    "id": "test_010",
+    "query": "Машина гуде і дуже голосно шумить",
+    "expected_category": "maintenance",
+    "expected_kb_id": "kb_017",
+    "relevant_keywords": ["шум", "гуде"]
+  },
+  {
+    "id": "test_011",
+    "query": "Кава стала гірчити, хоча раніше все було добре",
+    "expected_category": "brewing",
+    "expected_kb_id": "kb_012",
+    "relevant_keywords": ["гірка"]
+  },
+  {
+    "id": "test_012",
+    "query": "Як почистити заварний блок?",
+    "expected_category": "cleaning",
+    "expected_kb_id": "kb_008",
+    "relevant_keywords": ["заварний блок"]
+  },
+  {
+    "id": "test_013",
+    "query": "Натискаю кнопку але кава не виходить",
+    "expected_category": "no_coffee",
+    "expected_kb_id": "kb_014",
+    "relevant_keywords": ["кава не виходить"]
+  },
+  {
+    "id": "test_014",
+    "query": "Як скинути всі налаштування до початкових?",
+    "expected_category": "general",
+    "expected_kb_id": "kb_020",
+    "relevant_keywords": ["скинути", "налаштування"]
+  },
+  {
+    "id": "test_015",
+    "query": "Паровий пристрій не дає пару для молока",
+    "expected_category": "maintenance",
+    "expected_kb_id": "kb_019",
+    "relevant_keywords": ["пар", "молоко"]
+  },
+  {
+    "id": "test_016",
+    "query": "Error E04 on display",
+    "expected_category": "error_code",
+    "expected_kb_id": "kb_004",
+    "relevant_keywords": ["E04"]
+  },
+  {
+    "id": "test_017",
+    "query": "The coffee tastes very bitter",
+    "expected_category": "brewing",
+    "expected_kb_id": "kb_012",
+    "relevant_keywords": ["bitter"]
+  },
+  {
+    "id": "test_018",
+    "query": "Coffee machine is very loud and noisy",
+    "expected_category": "maintenance",
+    "expected_kb_id": "kb_017",
+    "relevant_keywords": ["noise", "loud"]
+  },
+  {
+    "id": "test_019",
+    "query": "Контейнер для гущі переповнений",
+    "expected_category": "error_code",
+    "expected_kb_id": "kb_005",
+    "relevant_keywords": ["контейнер", "гуща"]
+  },
+  {
+    "id": "test_020",
+    "query": "Як правильно налаштувати помол кавових зерен?",
+    "expected_category": "grinding",
+    "expected_kb_id": "kb_009",
+    "relevant_keywords": ["помол", "зерна"]
+  },
+  {
+    "id": "test_021",
+    "query": "Кава вже зовсім не гаряча, тепла",
+    "expected_category": "brewing",
+    "expected_kb_id": "kb_023",
+    "relevant_keywords": ["холодна", "температура"]
+  },
+  {
+    "id": "test_022",
+    "query": "Хочу зробити дві кави одночасно",
+    "expected_category": "general",
+    "expected_kb_id": "kb_025",
+    "relevant_keywords": ["дві чашки"]
+  },
+  {
+    "id": "test_023",
+    "query": "Кава тече занадто повільно, лише краплями",
+    "expected_category": "brewing",
+    "expected_kb_id": "kb_029",
+    "relevant_keywords": ["повільно", "краплями"]
+  },
+  {
+    "id": "test_024",
+    "query": "Як налаштувати автовимкнення машини",
+    "expected_category": "maintenance",
+    "expected_kb_id": "kb_026",
+    "relevant_keywords": ["ECO", "автовимкнення"]
+  },
+  {
+    "id": "test_025",
+    "query": "Як визначити жорсткість води у мене",
+    "expected_category": "water_system",
+    "expected_kb_id": "kb_027",
+    "relevant_keywords": ["жорсткість"]
+  }
+]
