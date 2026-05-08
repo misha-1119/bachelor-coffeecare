@@ -11,7 +11,7 @@ import time
 import requests
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
-LLAMA_MODEL = os.getenv("LLAMA_MODEL", "llama2")
+LLAMA_MODEL = os.getenv("LLAMA_MODEL", "hf.co/lapa-llm/lapa-v0.1.2-instruct-GGUF")
 
 SYSTEM_PROMPT = """Ти — CoffeeBot, дружній помічник з проблемами кавомашин. Відповідаєш як друг, а не як інструкція.
 
