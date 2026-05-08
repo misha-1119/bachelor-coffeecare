@@ -193,6 +193,8 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     handler = BUTTON_HANDLERS.get(text.strip())
     if handler is not None:
+        if text.strip() != BTN_MACHINE:
+            _ensure_state(user_id)["stage"] = "ready"
         await handler(update, ctx)
         return
 
@@ -236,7 +238,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 def _looks_like_question(text: str) -> bool:
     t = text.strip().lower()
-    if "?" in t or len(t) > 50:
+    if "?" in t or len(t) > 25:
         return True
     return any(t.startswith(w) for w in ("що ", "як ", "чому ", "де ", "коли ", "чи ", "не "))
 
