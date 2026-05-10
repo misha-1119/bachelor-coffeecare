@@ -27,10 +27,17 @@ SYSTEM_PROMPT = """Ти — CoffeeBot, дружній помічник з про
 """
 
 
-def build_prompt(user_query: str, retrieved_instruction: str, category: str, user_name: str | None = None) -> str:
+def build_prompt(
+    user_query: str,
+    retrieved_instruction: str,
+    category: str,
+    user_name: str | None = None,
+    user_bio: str | None = None,
+) -> str:
     name_line = f"Користувача звати {user_name}. Звертайся на ім'я один раз.\n" if user_name else ""
+    bio_line = f"Контекст користувача: {user_bio}\n" if user_bio else ""
     return f"""{SYSTEM_PROMPT}
-{name_line}
+{name_line}{bio_line}
 Категорія проблеми: {category}
 Запит користувача: {user_query}
 
@@ -69,11 +76,12 @@ class Generator:
         retrieved_instruction: str,
         category: str,
         user_name: str | None = None,
+        user_bio: str | None = None,
     ) -> str:
         if not self._is_available():
             return self._fallback(retrieved_instruction, user_name)
 
-        prompt = build_prompt(user_query, retrieved_instruction, category, user_name)
+        prompt = build_prompt(user_query, retrieved_instruction, category, user_name, user_bio)
         payload = {
             "model": self.model,
             "prompt": prompt,

@@ -38,6 +38,7 @@ class CoffeeBotAssistant:
         user_name: str | None = None,
         machine_model: str | None = None,
         conversation: dict | None = None,
+        user_bio: str | None = None,
     ) -> dict:
         if conversation is None:
             conversation = {}
@@ -124,6 +125,7 @@ class CoffeeBotAssistant:
             retrieved_instruction=entry.answer,
             category=category,
             user_name=user_name,
+            user_bio=user_bio,
         )
 
         source = "llama2" if self.generator._is_available() else "kb_direct"
