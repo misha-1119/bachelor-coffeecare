@@ -17,7 +17,14 @@ import threading
 import time
 
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import (
+    Update,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    BotCommand,
+)
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -144,12 +151,15 @@ def _ensure_state(user_id: int) -> dict:
     return state
 
 
+RKB_MENU = "☰ Меню"
+RKB_PROFILE = "👤 Профіль"
+RKB_OTHER = "🔄 Інша проблема"
+
+
 def _kb_step1() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("Додати кавомашину ☕", callback_data="action:add_machine"),
-            InlineKeyboardButton("Пропустити", callback_data="action:skip_machine"),
-        ]
+        [InlineKeyboardButton("Додати кавомашину ☕", callback_data="action:add_machine")],
+        [InlineKeyboardButton("Пропустити", callback_data="action:skip_machine")],
     ])
 
 
@@ -159,10 +169,8 @@ def _kb_step2() -> InlineKeyboardMarkup:
             InlineKeyboardButton("Помилка на дисплеї", callback_data="category:error_code"),
             InlineKeyboardButton("Проблема з кавою", callback_data="category:brewing"),
         ],
-        [
-            InlineKeyboardButton("Обслуговування / чистка", callback_data="category:cleaning"),
-            InlineKeyboardButton("Інше", callback_data="category:general"),
-        ],
+        [InlineKeyboardButton("Обслуговування / чистка", callback_data="category:cleaning")],
+        [InlineKeyboardButton("Інше", callback_data="category:general")],
     ])
 
 
@@ -171,12 +179,36 @@ def _kb_post_answer() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("Детальніше", callback_data="action:more_detail"),
             InlineKeyboardButton("Інша проблема", callback_data="action:other_problem"),
-            InlineKeyboardButton("Почати знову", callback_data="action:restart"),
         ],
         [
+            InlineKeyboardButton("Почати знову", callback_data="action:restart"),
             InlineKeyboardButton("Мій профіль", callback_data="action:my_profile"),
         ],
+        [InlineKeyboardButton("Головне меню", callback_data="action:menu")],
     ])
+
+
+def _kb_skip_model() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Пропустити", callback_data="action:skip_machine")],
+    ])
+
+
+def _kb_back_to_categories() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("↩️ Назад до категорій", callback_data="action:back_to_categories")],
+    ])
+
+
+def _reply_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton(RKB_MENU), KeyboardButton(RKB_PROFILE)],
+            [KeyboardButton(RKB_OTHER)],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
 
 
 async def _send_welcome(send_fn, user_id: int, username: str | None):
@@ -197,6 +229,7 @@ async def _send_welcome(send_fn, user_id: int, username: str | None):
         state["stage"] = "awaiting_name"
         await send_fn(
             "Привіт! Я CoffeeCare.\nЯк до вас звертатись?",
+            reply_markup=_reply_kb(),
         )
         return
 
@@ -204,12 +237,20 @@ async def _send_welcome(send_fn, user_id: int, username: str | None):
         await send_fn(
             f"Привіт, {name}! Я CoffeeCare.\n"
             "Для точнішої відповіді — вкажіть модель кавомашини:",
+            reply_markup=_reply_kb(),
+        )
+        await send_fn(
+            "Оберіть, як продовжити:",
             reply_markup=_kb_step1(),
         )
     else:
         await send_fn(
             f"Привіт, {name}! Я CoffeeCare.\n"
-            f"Ваша кавомашина: {machine}.\nЩо сталось?",
+            f"Ваша кавомашина: {_display_machine(machine)}.\nЩо сталось?",
+            reply_markup=_reply_kb(),
+        )
+        await send_fn(
+            "Оберіть категорію проблеми:",
             reply_markup=_kb_step2(),
         )
 
@@ -242,6 +283,7 @@ async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "  • Philips 3200 LatteGo\n"
         "  • Jura E8\n\n"
         "Або «не знаю» — відповідатиму загальними інструкціями.",
+        reply_markup=_kb_skip_model(),
     )
 
 
@@ -268,11 +310,17 @@ async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def _display_machine(value: str | None) -> str:
+    if not value or value == "universal":
+        return "не вказано"
+    return value.replace("_", " ").strip().title()
+
+
 def _format_profile(user_row: dict | None, state: dict) -> str:
     if not user_row:
         return "Профіль ще не створено. Надішліть кілька повідомлень — я запам'ятаю ваші вподобання."
     name = state.get("name") or user_row.get("name") or "не вказано"
-    machine = state.get("model") or user_row.get("machine") or "не вказано"
+    machine = _display_machine(state.get("model") or user_row.get("machine"))
     count = user_row.get("messageCount", 0)
     bio = user_row.get("bio")
     username = user_row.get("telegramUsername")
@@ -304,6 +352,30 @@ async def _show_profile(send_fn, user_id: int, username: str | None):
 async def cmd_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     await _show_profile(update.message.reply_text, user_id, update.effective_user.username)
+
+
+async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await _send_welcome(
+        update.message.reply_text,
+        update.effective_user.id,
+        update.effective_user.username,
+    )
+
+
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "<b>CoffeeCare — бот-консультант з кавомашин</b>\n\n"
+        "Команди:\n"
+        "/start — почати з початку\n"
+        "/menu — головне меню\n"
+        "/model — змінити кавомашину\n"
+        "/profile — мій профіль\n"
+        "/mode — перемкнути режим (NLP / правила)\n"
+        "/reset — очистити стан\n"
+        "/help — ця довідка\n\n"
+        "Напишіть проблему звичайним текстом — підкажу рішення."
+    )
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=_reply_kb())
 
 
 async def cmd_eval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -342,13 +414,15 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "  • Philips 3200 LatteGo\n"
             "  • Jura E8\n\n"
             "Або «не знаю» — відповідатиму загальними інструкціями.",
+            reply_markup=_kb_skip_model(),
         )
 
     elif data == "action:skip_machine":
-        state["model"] = state.get("model") or "universal"
+        state["model"] = "universal"
         state["stage"] = "ready"
+        _get_user_repo().set_machine(user_id, "universal")
         await query.edit_message_text(
-            "Добре. Що сталося з машиною?",
+            "Добре, відповідатиму загальними інструкціями.\nЩо сталось?",
             reply_markup=_kb_step2(),
         )
 
@@ -362,7 +436,18 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "cleaning": "Що саме потрібно: декальцинація, чистка блоку, молочна система?",
             "general": "Опишіть проблему — постараюся допомогти.",
         }
-        await query.edit_message_text(hints.get(category, "Опишіть проблему."))
+        await query.edit_message_text(
+            hints.get(category, "Опишіть проблему."),
+            reply_markup=_kb_back_to_categories(),
+        )
+
+    elif data == "action:back_to_categories":
+        state["hint_category"] = None
+        state["stage"] = "ready"
+        await query.edit_message_text(
+            "Оберіть категорію проблеми:",
+            reply_markup=_kb_step2(),
+        )
 
     elif data == "action:more_detail":
         conversation = USER_CONVERSATION.setdefault(user_id, {})
@@ -373,7 +458,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if entry:
                 await query.message.reply_text(entry.answer, reply_markup=_kb_post_answer())
                 return
-        await query.message.reply_text("Опишіть проблему детальніше — спробую знайти точнішу відповідь.")
+        await query.message.reply_text(
+            "Поки немає деталей до попередньої відповіді. Опишіть проблему детальніше — спробую знайти точніше рішення.",
+            reply_markup=_kb_post_answer(),
+        )
 
     elif data == "action:other_problem":
         USER_CONVERSATION.pop(user_id, None)
@@ -388,12 +476,26 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    elif data == "action:menu":
+        USER_CONVERSATION.pop(user_id, None)
+        await _send_welcome(
+            query.message.reply_text,
+            user_id,
+            query.from_user.username,
+        )
+
     elif data == "action:restart":
         USER_CONVERSATION.pop(user_id, None)
         await _send_welcome(
             query.message.reply_text,
             user_id,
             query.from_user.username,
+        )
+
+    else:
+        await query.message.reply_text(
+            "Не зрозумів кнопку. Спробуйте /menu.",
+            reply_markup=_kb_post_answer(),
         )
 
 
@@ -411,12 +513,31 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         debug_steps.append(f"[on_message] user={user_id} text={text!r}")
         debug_steps.append(f"[state] stage={state.get('stage')} model={state.get('model')!r} name={state.get('name')!r}")
 
+    stripped = text.strip()
+    if stripped in {RKB_MENU, RKB_PROFILE, RKB_OTHER} and state.get("stage") != "awaiting_name":
+        if stripped == RKB_MENU:
+            USER_CONVERSATION.pop(user_id, None)
+            await _send_welcome(update.message.reply_text, user_id, update.effective_user.username)
+            return
+        if stripped == RKB_PROFILE:
+            await _show_profile(update.message.reply_text, user_id, update.effective_user.username)
+            return
+        if stripped == RKB_OTHER:
+            USER_CONVERSATION.pop(user_id, None)
+            state["hint_category"] = None
+            state["stage"] = "ready"
+            await update.message.reply_text("Добре. Що ще сталося?", reply_markup=_kb_step2())
+            return
+
     if state.get("stage") == "awaiting_name":
         if debug_on:
             debug_steps.append("[flow] awaiting_name branch")
         name = _normalize_name(text)
         if not name:
-            await update.message.reply_text("Напишіть, будь ласка, ім'я (1–30 символів).")
+            await update.message.reply_text(
+                "Напишіть, будь ласка, ім'я (1–30 символів).",
+                reply_markup=_reply_kb(),
+            )
             await _send_debug(update.message.reply_text, user_id, debug_steps + ["[flow] empty name → reprompt"])
             return
         state["name"] = name
@@ -429,12 +550,20 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"Приємно познайомитись, {name}!\n"
                 "Додайте кавомашину для точніших відповідей:",
+                reply_markup=_reply_kb(),
+            )
+            await update.message.reply_text(
+                "Оберіть, як продовжити:",
                 reply_markup=_kb_step1(),
             )
         else:
             await update.message.reply_text(
                 f"Приємно познайомитись, {name}!\n"
-                f"Ваша кавомашина: {machine}.\nЩо сталось?",
+                f"Ваша кавомашина: {_display_machine(machine)}.\nЩо сталось?",
+                reply_markup=_reply_kb(),
+            )
+            await update.message.reply_text(
+                "Оберіть категорію проблеми:",
                 reply_markup=_kb_step2(),
             )
         await _send_debug(update.message.reply_text, user_id, debug_steps)
@@ -443,9 +572,22 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if state.get("stage") == "awaiting_model":
         if debug_on:
             debug_steps.append("[flow] awaiting_model branch")
-        if _looks_like_question(text):
+        if _looks_like_skip(text):
+            state["model"] = "universal"
             state["stage"] = "ready"
+            repo.set_machine(user_id, "universal")
+            if debug_on:
+                debug_steps.append("[flow] looks_like_skip → universal")
+            await update.message.reply_text(
+                "Добре, відповідатиму загальними інструкціями.\nЩо сталось?",
+                reply_markup=_kb_step2(),
+            )
+            await _send_debug(update.message.reply_text, user_id, debug_steps)
+            return
+        if _looks_like_question(text):
             state["model"] = state.get("model") or "universal"
+            state["stage"] = "ready"
+            repo.set_machine(user_id, state["model"])
             if debug_on:
                 debug_steps.append(f"[flow] looks_like_question → model={state['model']!r}, fall through to respond")
         else:
@@ -455,7 +597,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             repo.set_machine(user_id, normalized_model)
             if debug_on:
                 debug_steps.append(f"[repo] set_machine={normalized_model!r}")
-            label = normalized_model if normalized_model != "universal" else None
+            label = _display_machine(normalized_model) if normalized_model != "universal" else None
             reply = (
                 f"Записав: {label}.\n\nТепер — що сталося?" if label
                 else "Добре. Що сталося з машиною?"
@@ -542,11 +684,22 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _send_debug(update.message.reply_text, user_id, debug_steps)
 
 
+_SKIP_TOKENS = {
+    "не знаю", "не знаю.", "не пам'ятаю", "не пам’ятаю",
+    "немає", "нема", "хз", "skip", "пропустити", "пропустити.",
+    "—", "-", "—.", "?", "??",
+}
+
+
+def _looks_like_skip(text: str) -> bool:
+    return text.strip().lower() in _SKIP_TOKENS
+
+
 def _looks_like_question(text: str) -> bool:
     t = text.strip().lower()
-    if "?" in t or len(t) > 25:
+    if "?" in t:
         return True
-    return any(t.startswith(w) for w in ("що ", "як ", "чому ", "де ", "коли ", "чи ", "не "))
+    return any(t.startswith(w) for w in ("що ", "як ", "чому ", "де ", "коли ", "чи "))
 
 
 def _normalize_name(text: str) -> str | None:
@@ -574,8 +727,10 @@ def start_bot():
     if not token or token == "your_token_here":
         raise RuntimeError("TELEGRAM_BOT_TOKEN missing or placeholder in .env")
 
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(token).post_init(_post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("menu", cmd_menu))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("mode", cmd_mode))
@@ -588,6 +743,18 @@ def start_bot():
     log.info("Bot starting... DEBUG_MODE=%s", os.getenv("DEBUG_MODE", "0"))
     threading.Thread(target=_warmup, daemon=True, name="warmup").start()
     app.run_polling()
+
+
+async def _post_init(app: Application) -> None:
+    await app.bot.set_my_commands([
+        BotCommand("start", "Почати"),
+        BotCommand("menu", "Головне меню"),
+        BotCommand("model", "Змінити кавомашину"),
+        BotCommand("profile", "Мій профіль"),
+        BotCommand("mode", "Перемкнути режим"),
+        BotCommand("reset", "Очистити стан"),
+        BotCommand("help", "Довідка"),
+    ])
 
 
 def _warmup():
