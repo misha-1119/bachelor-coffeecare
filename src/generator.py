@@ -1,5 +1,5 @@
 """
-Stage 2: LLaMA 2 via Ollama for generating short conversational responses.
+Stage 2: Lapa LLM via Ollama for generating short conversational responses.
 
 The generator turns a long KB instruction into a short human-like reply
 addressed to the user by name, never copying the KB text verbatim.
@@ -98,7 +98,7 @@ class Generator:
             response.raise_for_status()
             return response.json().get("response", "").strip()
         except Exception as e:
-            print(f"[Generator] LLaMA 2 error: {e}")
+            print(f"[Generator] Lapa LLM error: {e}")
             return self._fallback(retrieved_instruction, user_name)
 
     def _fallback(self, instruction: str, user_name: str | None = None) -> str:

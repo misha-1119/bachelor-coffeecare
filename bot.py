@@ -5,15 +5,20 @@ Commands:
   /start  — greet and start flow
   /model  — set machine brand/model
   /mode   — toggle NLP <-> rule_based per user
+  /debug  — toggle per-user debug trace (/debug on|off, default from DEBUG_MODE env)
   /reset  — clear user state
   /eval   — dev only: run evaluation
 """
 
 import os
+import asyncio
 import logging
+import threading
+import time
 
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -30,6 +35,7 @@ from src.user_repository import UserRepository
 from src.bio_generator import generate_bio
 
 BIO_TRIGGER_AT = 5
+MAX_DEBUG_CHARS = 3500
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -39,6 +45,70 @@ USER_STATE: dict[int, dict] = {}
 USER_MODE: dict[int, str] = {}
 USER_CONVERSATION: dict[int, dict] = {}
 USER_MESSAGES: dict[int, list[str]] = {}
+USER_DEBUG: dict[int, bool] = {}
+
+
+def _env_debug_default() -> bool:
+    return os.getenv("DEBUG_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_enabled(user_id: int) -> bool:
+    return USER_DEBUG.get(user_id, _env_debug_default())
+
+
+async def _send_debug(send_fn, user_id: int, steps: list[str]) -> None:
+    if not _debug_enabled(user_id) or not steps:
+        return
+    body = "\n".join(steps)
+    if len(body) > MAX_DEBUG_CHARS:
+        body = body[:MAX_DEBUG_CHARS] + "\n…[truncated]"
+    await send_fn(f"🐞 debug trace:\n<pre>{_html_escape(body)}</pre>", parse_mode="HTML")
+
+
+async def _live_debug_pump(bot, chat_id: int, steps: list[str], started_at: float,
+                            tick_interval: float = 1.5, heartbeat_every: float = 4.0):
+    """Periodic pump: flushes new debug steps + keeps typing indicator alive + emits heartbeats.
+    Cancel when work done."""
+    last_idx = 0
+    last_hb = started_at
+    try:
+        await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+        while True:
+            await asyncio.sleep(tick_interval)
+            now = time.monotonic()
+            new = steps[last_idx:]
+            if new:
+                last_idx = len(steps)
+                body = "\n".join(new)
+                if len(body) > MAX_DEBUG_CHARS:
+                    body = body[:MAX_DEBUG_CHARS] + "\n…[truncated]"
+                try:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=f"🐞 step (+{now - started_at:.1f}s):\n<pre>{_html_escape(body)}</pre>",
+                        parse_mode="HTML",
+                    )
+                except Exception as e:
+                    log.warning("live debug push failed: %s", e)
+                last_hb = now
+            elif now - last_hb >= heartbeat_every:
+                try:
+                    await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+                    await bot.send_message(chat_id=chat_id, text=f"🐞 working… +{now - started_at:.1f}s")
+                except Exception as e:
+                    log.warning("heartbeat failed: %s", e)
+                last_hb = now
+            else:
+                try:
+                    await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+                except Exception:
+                    pass
+    except asyncio.CancelledError:
+        pass
+
+
+def _html_escape(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 _assistant: CoffeeBotAssistant | None = None
 _rule_based: RuleBasedAssistant | None = None
@@ -183,6 +253,21 @@ async def cmd_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Режим змінено на: {new}")
 
 
+async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    arg = (ctx.args[0].lower() if ctx.args else "").strip()
+    if arg in {"on", "1", "true", "yes"}:
+        USER_DEBUG[user_id] = True
+    elif arg in {"off", "0", "false", "no"}:
+        USER_DEBUG[user_id] = False
+    else:
+        USER_DEBUG[user_id] = not _debug_enabled(user_id)
+    state = "ON" if _debug_enabled(user_id) else "OFF"
+    await update.message.reply_text(
+        f"Debug mode: {state}\n(env default: DEBUG_MODE={os.getenv('DEBUG_MODE', '0')})"
+    )
+
+
 def _format_profile(user_row: dict | None, state: dict) -> str:
     if not user_row:
         return "Профіль ще не створено. Надішліть кілька повідомлень — я запам'ятаю ваші вподобання."
@@ -320,14 +405,25 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     repo = _get_user_repo()
     repo.upsert_user(user_id, update.effective_user.username)
 
+    debug_on = _debug_enabled(user_id)
+    debug_steps: list[str] = []
+    if debug_on:
+        debug_steps.append(f"[on_message] user={user_id} text={text!r}")
+        debug_steps.append(f"[state] stage={state.get('stage')} model={state.get('model')!r} name={state.get('name')!r}")
+
     if state.get("stage") == "awaiting_name":
+        if debug_on:
+            debug_steps.append("[flow] awaiting_name branch")
         name = _normalize_name(text)
         if not name:
             await update.message.reply_text("Напишіть, будь ласка, ім'я (1–30 символів).")
+            await _send_debug(update.message.reply_text, user_id, debug_steps + ["[flow] empty name → reprompt"])
             return
         state["name"] = name
         state["stage"] = "ready"
         repo.set_name(user_id, name)
+        if debug_on:
+            debug_steps.append(f"[repo] set_name={name!r}")
         machine = state.get("model")
         if not machine or machine == "universal":
             await update.message.reply_text(
@@ -341,23 +437,31 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"Ваша кавомашина: {machine}.\nЩо сталось?",
                 reply_markup=_kb_step2(),
             )
+        await _send_debug(update.message.reply_text, user_id, debug_steps)
         return
 
     if state.get("stage") == "awaiting_model":
+        if debug_on:
+            debug_steps.append("[flow] awaiting_model branch")
         if _looks_like_question(text):
             state["stage"] = "ready"
             state["model"] = state.get("model") or "universal"
+            if debug_on:
+                debug_steps.append(f"[flow] looks_like_question → model={state['model']!r}, fall through to respond")
         else:
             normalized_model = _normalize_model_input(text)
             state["model"] = normalized_model
             state["stage"] = "ready"
             repo.set_machine(user_id, normalized_model)
+            if debug_on:
+                debug_steps.append(f"[repo] set_machine={normalized_model!r}")
             label = normalized_model if normalized_model != "universal" else None
             reply = (
                 f"Записав: {label}.\n\nТепер — що сталося?" if label
                 else "Добре. Що сталося з машиною?"
             )
             await update.message.reply_text(reply, reply_markup=_kb_step2())
+            await _send_debug(update.message.reply_text, user_id, debug_steps)
             return
 
     model = state.get("model") or "universal"
@@ -368,6 +472,8 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(buf) < BIO_TRIGGER_AT:
         buf.append(text)
     count = repo.increment_message_count(user_id)
+    if debug_on:
+        debug_steps.append(f"[repo] increment_message_count → {count}")
 
     user_row = repo.get_user(user_id)
     user_bio = user_row.get("bio") if user_row else None
@@ -376,6 +482,8 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not state.get("model") and user_row and user_row.get("machine"):
         state["model"] = user_row["machine"]
         model = state["model"]
+    if debug_on:
+        debug_steps.append(f"[merge] name={state.get('name')!r} model={model!r} bio={'yes' if user_bio else 'no'}")
 
     if (
         count is not None
@@ -383,23 +491,55 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         and user_bio is None
         and len(buf) >= BIO_TRIGGER_AT
     ):
+        if debug_on:
+            debug_steps.append(f"[bio] generating (count={count} buf={len(buf)})")
         bio = generate_bio(buf, machine=model)
         if bio:
             repo.set_bio(user_id, bio)
             user_bio = bio
+            if debug_on:
+                debug_steps.append(f"[bio] saved len={len(bio)}")
+        elif debug_on:
+            debug_steps.append("[bio] generation returned empty")
 
-    if mode == "rule_based":
-        result = _get_rule_based().respond(text)
-    else:
-        result = _get_assistant().respond(
-            text,
-            user_name=state.get("name"),
-            machine_model=model,
-            conversation=conversation,
-            user_bio=user_bio,
+    if debug_on:
+        debug_steps.append(f"[dispatch] mode={mode}")
+
+    pump_task: asyncio.Task | None = None
+    started_at = time.monotonic()
+    if debug_on:
+        pump_task = asyncio.create_task(
+            _live_debug_pump(ctx.bot, update.effective_chat.id, debug_steps, started_at)
         )
 
+    try:
+        if mode == "rule_based":
+            result = await asyncio.to_thread(_get_rule_based().respond, text)
+            if debug_on:
+                debug_steps.append(f"[rule_based] source={result.get('source')} cat={result.get('category')} conf={result.get('confidence')}")
+        else:
+            result = await asyncio.to_thread(
+                _get_assistant().respond,
+                text,
+                state.get("name"),
+                model,
+                conversation,
+                user_bio,
+                debug_steps if debug_on else None,
+            )
+    finally:
+        if pump_task is not None:
+            pump_task.cancel()
+            try:
+                await pump_task
+            except asyncio.CancelledError:
+                pass
+
+    if debug_on:
+        debug_steps.append(f"[result] +{time.monotonic() - started_at:.2f}s source={result.get('source')} cat={result.get('category')} conf={result.get('confidence')} kb={result.get('kb_entry_id')}")
+
     await update.message.reply_text(result["response"], reply_markup=_kb_post_answer())
+    await _send_debug(update.message.reply_text, user_id, debug_steps)
 
 
 def _looks_like_question(text: str) -> bool:
@@ -439,13 +579,35 @@ def start_bot():
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("mode", cmd_mode))
+    app.add_handler(CommandHandler("debug", cmd_debug))
     app.add_handler(CommandHandler("eval", cmd_eval))
     app.add_handler(CommandHandler("profile", cmd_profile))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
-    log.info("Bot starting...")
+    log.info("Bot starting... DEBUG_MODE=%s", os.getenv("DEBUG_MODE", "0"))
+    threading.Thread(target=_warmup, daemon=True, name="warmup").start()
     app.run_polling()
+
+
+def _warmup():
+    t0 = time.monotonic()
+    try:
+        log.info("[warmup] loading classifier (liberta) + assistant...")
+        assistant = _get_assistant()
+        log.info("[warmup] classifier ready (+%.2fs). Pinging Lapa...", time.monotonic() - t0)
+        try:
+            assistant.generator.generate(
+                user_query="тест",
+                retrieved_instruction="тестова інструкція для прогріву моделі.",
+                category="warmup",
+            )
+            log.info("[warmup] Lapa hot (+%.2fs total).", time.monotonic() - t0)
+        except Exception as e:
+            log.warning("[warmup] Lapa ping failed: %s", e)
+        log.info("[warmup] complete (+%.2fs).", time.monotonic() - t0)
+    except Exception as e:
+        log.warning("[warmup] failed: %s", e)
 
 
 if __name__ == "__main__":

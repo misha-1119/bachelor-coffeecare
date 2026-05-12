@@ -30,8 +30,12 @@ FOLLOWUP_YES_RE = re.compile(
 
 FOLLOWUP_NO_RE = re.compile(
     r"^(ні+|нє+|нєєє|нєт|не-а|неа|нєа|nope|нет|no+|"
-    r"не\s+(допомогло|спрацювало|працює|допомагає)|"
     r"так\s+само|той\s+самий|same|still)\b",
+    re.IGNORECASE,
+)
+
+FOLLOWUP_NO_VERB_RE = re.compile(
+    r"^не\s+(допомогло|спрацювало|працює|допомагає)\s*[.!?…]*\s*$",
     re.IGNORECASE,
 )
 
@@ -137,7 +141,8 @@ def is_followup_yes(query: str) -> bool:
 
 
 def is_followup_no(query: str) -> bool:
-    return bool(FOLLOWUP_NO_RE.match(query.strip()))
+    q = query.strip()
+    return bool(FOLLOWUP_NO_RE.match(q) or FOLLOWUP_NO_VERB_RE.match(q))
 
 
 def is_negative_meta(query: str) -> bool:
