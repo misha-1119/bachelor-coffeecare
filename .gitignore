@@ -9,4 +9,5 @@ convex/_generated/
 .DS_Store
 data/manuals/**/*.pdf
 data/manuals/_parsed/
+data/qdrant/
 /.claude

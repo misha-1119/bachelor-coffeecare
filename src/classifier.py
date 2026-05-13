@@ -1,9 +1,9 @@
 """
 Stage 1: liberta-large (Ukrainian BERT) — semantic search and category classification.
 
-Encodes the user query into a 1024-dim vector and finds the closest KB entry
-by cosine similarity, then re-ranks with lexical boosts and a hard error-code
-override.
+When a `VectorRetriever` is supplied, semantic search is delegated to Qdrant
+(persistent HNSW + payload filter on `model`). The legacy in-memory NumPy path
+is kept as a fallback for tests / local debugging.
 """
 
 import re
@@ -33,11 +33,18 @@ def _is_manual_extract(entry: KBEntry) -> bool:
 
 
 class Classifier:
-    def __init__(self, kb: KnowledgeBase):
+    def __init__(self, kb: KnowledgeBase, retriever=None):
         self.kb = kb
-        self.is_manual = np.array([_is_manual_extract(e) for e in kb.entries], dtype=bool)
-        self.model = self._load_model()
-        self.kb_embeddings = self._encode_kb()
+        self.retriever = retriever
+        self.entries_by_id = {e.id: e for e in kb.entries}
+        if retriever is not None:
+            self.model = retriever.encoder
+            self.is_manual = None
+            self.kb_embeddings = None
+        else:
+            self.is_manual = np.array([_is_manual_extract(e) for e in kb.entries], dtype=bool)
+            self.model = self._load_model()
+            self.kb_embeddings = self._encode_kb()
 
     def _load_model(self) -> SentenceTransformer:
         try:
@@ -122,6 +129,45 @@ class Classifier:
         if forced is not None and (not exclude_ids or forced.id not in exclude_ids):
             return forced, 1.0
 
+        if self.retriever is not None:
+            return self._best_match_vector(query, machine_model, exclude_ids)
+        return self._best_match_numpy(query, machine_model, exclude_ids)
+
+    def _best_match_vector(
+        self,
+        query: str,
+        machine_model: str | None,
+        exclude_ids: set[str] | None,
+    ) -> tuple[KBEntry | None, float]:
+        hits = self.retriever.search_qa(query, machine_model, k=10)
+        if not hits:
+            return None, 0.0
+        q_lower = query.lower()
+        best_entry: KBEntry | None = None
+        best_score = -1.0
+        for hit in hits:
+            entry_id = hit.payload.get("entry_id")
+            if not entry_id:
+                continue
+            if exclude_ids and entry_id in exclude_ids:
+                continue
+            entry = self.entries_by_id.get(entry_id)
+            if entry is None:
+                continue
+            score = hit.score + self._keyword_boost(q_lower, entry)
+            if score > best_score:
+                best_score = score
+                best_entry = entry
+        if best_entry is None:
+            return None, 0.0
+        return best_entry, float(best_score)
+
+    def _best_match_numpy(
+        self,
+        query: str,
+        machine_model: str | None,
+        exclude_ids: set[str] | None,
+    ) -> tuple[KBEntry | None, float]:
         q_emb = self.model.encode([query], convert_to_numpy=True, normalize_embeddings=True)[0]
         sem_scores = self.kb_embeddings @ q_emb
         q_lower = query.lower()

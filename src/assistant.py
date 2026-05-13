@@ -2,6 +2,8 @@
 CoffeeBotAssistant: combines triage + Stage 1 (liberta-large) + Stage 2 (Lapa LLM).
 """
 
+import os
+
 from src.knowledge_base import KnowledgeBase
 from src.classifier import Classifier
 from src.generator import Generator
@@ -26,11 +28,66 @@ CONFIDENCE_THRESHOLD = 0.55
 MIN_MEANINGFUL_LEN = 4
 
 
+def _chunk_threshold() -> float:
+    try:
+        return float(os.getenv("CHUNK_THRESHOLD", "0.45"))
+    except ValueError:
+        return 0.45
+
+
+def _try_build_retriever():
+    """Open Qdrant if it has been ingested; return None and warn otherwise."""
+    try:
+        from src.retriever import build_default_retriever, QA_COLLECTION
+    except Exception as exc:
+        print(f"[assistant] retriever import failed ({exc}); using numpy KB path")
+        return None
+    try:
+        retriever = build_default_retriever()
+        if retriever.count(QA_COLLECTION) == 0:
+            print("[assistant] kb_qa empty — run scripts/ingest_kb.py. Using numpy KB path.")
+            return None
+        return retriever
+    except Exception as exc:
+        print(f"[assistant] retriever init failed ({exc}); using numpy KB path")
+        return None
+
+
+def _resolve_brand(model_slug: str | None, known_brands: list[str]) -> str | None:
+    """Match a user model slug to the longest known brand prefix.
+
+    Examples:
+        philips_ep2231         -> philips
+        russell_hobbs_24370    -> russell_hobbs   (longer prefix wins over `russell`)
+        delonghi_magnifica_s   -> delonghi
+        universal / None       -> None
+    """
+    if not model_slug or model_slug == "universal" or not known_brands:
+        return None
+    candidates = [b for b in known_brands if model_slug == b or model_slug.startswith(b + "_")]
+    if not candidates:
+        return None
+    candidates.sort(key=len, reverse=True)
+    return candidates[0]
+
+
 class CoffeeBotAssistant:
     def __init__(self):
         self.kb = KnowledgeBase()
-        self.classifier = Classifier(self.kb)
+        self.retriever = _try_build_retriever()
+        self.classifier = Classifier(self.kb, retriever=self.retriever)
         self.generator = Generator()
+        self.chunk_threshold = _chunk_threshold()
+        self.known_brands: list[str] = []
+        if self.retriever is not None:
+            try:
+                from src.retriever import CHUNKS_COLLECTION
+
+                if self.retriever.count(CHUNKS_COLLECTION) > 0:
+                    self.known_brands = self.retriever.list_brands()
+                    print(f"[assistant] known brands: {self.known_brands}")
+            except Exception as exc:
+                print(f"[assistant] could not list brands ({exc})")
 
     def respond(
         self,
@@ -126,7 +183,18 @@ class CoffeeBotAssistant:
         _dbg(f"[classifier] entry={entry.id if entry else None} cat={category} conf={confidence:.3f} threshold={CONFIDENCE_THRESHOLD}")
 
         if entry is None or confidence < CONFIDENCE_THRESHOLD:
-            _dbg("[assistant] low confidence → fallback")
+            chunk_response = self._try_chunk_fallback(
+                user_query=user_query,
+                normalized=normalized,
+                machine_model=machine_model,
+                user_name=user_name,
+                user_bio=user_bio,
+                conversation=conversation,
+                debug_log=debug_log,
+            )
+            if chunk_response is not None:
+                return chunk_response
+            _dbg("[assistant] low confidence + no chunk hit → fallback")
             return self._fallback_response(user_name)
 
         conversation["last_entry_id"] = entry.id
@@ -163,6 +231,119 @@ class CoffeeBotAssistant:
             "kb_entry_id": entry.id,
             "confidence": confidence,
             "source": source,
+        }
+
+    def _try_chunk_fallback(
+        self,
+        user_query: str,
+        normalized: str,
+        machine_model: str | None,
+        user_name: str | None,
+        user_bio: str | None,
+        conversation: dict,
+        debug_log: list[str] | None,
+    ) -> dict | None:
+        if self.retriever is None:
+            return None
+
+        def _dbg(msg: str) -> None:
+            if debug_log is not None:
+                debug_log.append(msg)
+
+        best = None
+        tier = None  # "model" | "brand" | "universal"
+        brand = _resolve_brand(machine_model, self.known_brands)
+
+        # Tier 1: exact model + universal chunks
+        try:
+            hits = self.retriever.search_chunks(normalized, machine_model, k=3)
+        except Exception as exc:
+            _dbg(f"[retriever] tier1 search failed ({exc})")
+            hits = []
+        if hits:
+            _dbg(
+                f"[retriever] tier1=model score={hits[0].score:.3f} "
+                f"file={hits[0].payload.get('file')} page={hits[0].payload.get('page_start')}"
+            )
+            if hits[0].score >= self.chunk_threshold:
+                best, tier = hits[0], "model"
+
+        # Tier 2: same brand, excluding exact model (already tried)
+        if best is None and brand:
+            try:
+                bhits = self.retriever.search_chunks_by_brand(
+                    normalized, brand=brand, k=3, exclude_model=machine_model
+                )
+            except Exception as exc:
+                _dbg(f"[retriever] tier2 search failed ({exc})")
+                bhits = []
+            if bhits:
+                _dbg(
+                    f"[retriever] tier2=brand={brand} score={bhits[0].score:.3f} "
+                    f"file={bhits[0].payload.get('file')} page={bhits[0].payload.get('page_start')}"
+                )
+                if bhits[0].score >= self.chunk_threshold:
+                    best, tier = bhits[0], "brand"
+
+        # Tier 3: universal (any brand). Only if no model and no brand hit yet.
+        if best is None:
+            try:
+                uhits = self.retriever.search_chunks(normalized, machine_model=None, k=3)
+            except Exception as exc:
+                _dbg(f"[retriever] tier3 search failed ({exc})")
+                uhits = []
+            if uhits:
+                _dbg(
+                    f"[retriever] tier3=any score={uhits[0].score:.3f} "
+                    f"file={uhits[0].payload.get('file')} page={uhits[0].payload.get('page_start')}"
+                )
+                if uhits[0].score >= self.chunk_threshold:
+                    best, tier = uhits[0], "universal"
+
+        if best is None or tier is None:
+            _dbg("[retriever] chunk_fallback no hits above threshold")
+            return None
+
+        chunk_text = (best.payload.get("text") or "").strip()
+        if not chunk_text:
+            return None
+        ref_file = best.payload.get("file", "")
+        page = best.payload.get("page_start")
+        hit_model = best.payload.get("model")
+
+        if tier == "model":
+            citation = f"\n\n_Джерело: {ref_file}"
+        elif tier == "brand":
+            citation = f"\n\n_Джерело зі схожої моделі ({hit_model}): {ref_file}"
+        else:
+            citation = f"\n\n_Джерело: {ref_file}"
+        if page:
+            citation += f", стор. {page}"
+        citation += "._"
+
+        gen_available = self.generator._is_available()
+        instruction = chunk_text if len(chunk_text) <= 1800 else chunk_text[:1800] + "..."
+        if gen_available:
+            response = self.generator.generate(
+                user_query=user_query,
+                retrieved_instruction=instruction,
+                category="manual",
+                user_name=user_name,
+                user_bio=user_bio,
+            )
+        else:
+            prefix = f"{user_name}, " if user_name else ""
+            response = f"{prefix}знайшов у мануалі:\n\n{instruction}"
+        response = f"{response}{citation}"
+
+        conversation["last_entry_id"] = None
+        return {
+            "response": response,
+            "category": "manual",
+            "kb_entry_id": None,
+            "confidence": float(best.score),
+            "source": "lapa_manual" if gen_available else "manual_direct",
+            "manual_tier": tier,
         }
 
     def _get_entry_by_id(self, entry_id: str | None):
