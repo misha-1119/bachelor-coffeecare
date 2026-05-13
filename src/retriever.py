@@ -178,14 +178,14 @@ class VectorRetriever:
 
     def _search(self, collection: str, query: str, model: str | None, k: int) -> list[SearchHit]:
         vec = self.encode(query)
-        result = self.client.search(
+        result = self.client.query_points(
             collection_name=collection,
-            query_vector=vec.tolist(),
+            query=vec.tolist(),
             query_filter=self._model_filter(model),
             limit=k,
             with_payload=True,
         )
-        return [SearchHit(score=float(p.score), payload=dict(p.payload or {})) for p in result]
+        return [SearchHit(score=float(p.score), payload=dict(p.payload or {})) for p in result.points]
 
     def search_qa(self, query: str, model: str | None = None, k: int = 5) -> list[SearchHit]:
         return self._search(QA_COLLECTION, query, model, k)
@@ -201,14 +201,14 @@ class VectorRetriever:
         exclude_model: str | None = None,
     ) -> list[SearchHit]:
         vec = self.encode(query)
-        result = self.client.search(
+        result = self.client.query_points(
             collection_name=CHUNKS_COLLECTION,
-            query_vector=vec.tolist(),
+            query=vec.tolist(),
             query_filter=self._brand_filter(brand, exclude_model=exclude_model),
             limit=k,
             with_payload=True,
         )
-        return [SearchHit(score=float(p.score), payload=dict(p.payload or {})) for p in result]
+        return [SearchHit(score=float(p.score), payload=dict(p.payload or {})) for p in result.points]
 
     def list_brands(self) -> list[str]:
         """Distinct `brand` values in kb_chunks. Cheap scroll over payload."""

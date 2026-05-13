@@ -52,28 +52,61 @@ def _topk_numpy(classifier: Classifier, query: str, k: int) -> list[str]:
     return [classifier.kb.entries[int(i)].id for i in order]
 
 
-def _topk_qdrant(retriever: VectorRetriever, query: str, k: int) -> list[str]:
-    from src.triage import normalize as _normalize
+def _rerank_with_boost(hits, query: str, entries_by_id, classifier: Classifier, k: int) -> list[tuple[str, float]]:
+    """Mirror production: cosine score + keyword boost, then sort. Returns [(entry_id, score), ...]."""
+    q_lower = query.lower()
+    scored: list[tuple[str, float]] = []
+    for h in hits:
+        eid = h.payload.get("entry_id", "")
+        entry = entries_by_id.get(eid)
+        if entry is None:
+            scored.append((eid, float(h.score)))
+            continue
+        boost = classifier._keyword_boost(q_lower, entry)
+        scored.append((eid, float(h.score) + boost))
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored[:k]
 
-    hits = retriever.search_qa(_normalize(query), machine_model=None, k=k)
-    return [h.payload.get("entry_id", "") for h in hits]
 
-
-def _topk_qdrant_chunks(retriever: VectorRetriever, query: str, k: int) -> list[str]:
-    """QA top-k, but if best QA score is weak, splice top chunk page ref in slot 0."""
+def _topk_qdrant(
+    retriever: VectorRetriever,
+    query: str,
+    k: int,
+    entries_by_id: dict,
+    classifier: Classifier,
+    pool: int = 50,
+) -> list[str]:
+    """Production-faithful: fetch top-`pool`, apply keyword boost, re-rank, return top-k."""
     from src.triage import normalize as _normalize
 
     qn = _normalize(query)
-    qa = retriever.search_qa(qn, machine_model=None, k=k)
-    qa_ids = [h.payload.get("entry_id", "") for h in qa]
-    best_score = qa[0].score if qa else 0.0
-    if best_score < 0.55:
-        chunks = retriever.search_chunks(qn, machine_model=None, k=1)
+    hits = retriever.search_qa(qn, model=None, k=pool)
+    reranked = _rerank_with_boost(hits, qn, entries_by_id, classifier, k)
+    return [eid for eid, _ in reranked]
+
+
+def _topk_qdrant_chunks(
+    retriever: VectorRetriever,
+    query: str,
+    k: int,
+    entries_by_id: dict,
+    classifier: Classifier,
+    pool: int = 50,
+) -> list[str]:
+    """QA top-k with boost; if best QA combined score is weak, splice top chunk page ref in slot 0."""
+    from src.triage import normalize as _normalize
+
+    qn = _normalize(query)
+    hits = retriever.search_qa(qn, model=None, k=pool)
+    reranked = _rerank_with_boost(hits, qn, entries_by_id, classifier, k)
+    ids = [eid for eid, _ in reranked]
+    best_combined = reranked[0][1] if reranked else 0.0
+    if best_combined < 0.55:
+        chunks = retriever.search_chunks(qn, model=None, k=1)
         if chunks and chunks[0].score >= 0.45:
-            # surface a synthetic identifier so the test sees the manual reference
             tag = f"manual:{chunks[0].payload.get('file', '')}#{chunks[0].payload.get('page_start', 0)}"
-            qa_ids = [tag] + qa_ids
-    return qa_ids[:k]
+            ids = [tag] + ids
+    return ids[:k]
 
 
 def _metrics(ranked_ids: list[str], gold: str) -> tuple[float, float, float]:
@@ -148,22 +181,24 @@ def main() -> int:
 
     encoder = load_default_encoder()
     kb = KnowledgeBase()
+    entries_by_id = {e.id: e for e in kb.entries}
 
     results = []
 
-    if "numpy" in args.variants:
-        print("[eval] preparing numpy classifier (encoding full KB)...")
-        classifier_np = Classifier(kb)
-        # The above re-loads liberta — replace its encoder with the already-loaded one
-        classifier_np.model = encoder
-        import numpy as np
+    classifier_np = Classifier(kb)
+    # The above re-loads liberta — replace its encoder with the already-loaded one
+    classifier_np.model = encoder
+    import numpy as np
 
-        texts = [
-            f"{e.category}: {e.question} | {' '.join(e.keywords[:10])}" for e in kb.entries
-        ]
-        classifier_np.kb_embeddings = encoder.encode(
-            texts, convert_to_numpy=True, normalize_embeddings=True
-        )
+    texts = [
+        f"{e.category}: {e.question} | {' '.join(e.keywords[:10])}" for e in kb.entries
+    ]
+    classifier_np.kb_embeddings = encoder.encode(
+        texts, convert_to_numpy=True, normalize_embeddings=True
+    )
+
+    if "numpy" in args.variants:
+        print("[eval] running numpy variant...")
         results.append(
             _run_variant("numpy", queries, lambda q, k: _topk_numpy(classifier_np, q, k))
         )
@@ -181,7 +216,13 @@ def main() -> int:
             return 1
 
     if "qdrant" in args.variants:
-        results.append(_run_variant("qdrant", queries, lambda q, k: _topk_qdrant(retriever, q, k)))
+        results.append(
+            _run_variant(
+                "qdrant",
+                queries,
+                lambda q, k: _topk_qdrant(retriever, q, k, entries_by_id, classifier_np),
+            )
+        )
 
     if "qdrant_chunks" in args.variants:
         try:
@@ -194,7 +235,9 @@ def main() -> int:
         else:
             results.append(
                 _run_variant(
-                    "qdrant+chunks", queries, lambda q, k: _topk_qdrant_chunks(retriever, q, k)
+                    "qdrant+chunks",
+                    queries,
+                    lambda q, k: _topk_qdrant_chunks(retriever, q, k, entries_by_id, classifier_np),
                 )
             )
 
