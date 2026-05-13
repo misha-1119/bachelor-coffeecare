@@ -129,6 +129,23 @@ class CoffeeBotAssistant:
                     "confidence": 1.0,
                     "source": "kb_full",
                 }
+            last_chunk = conversation.get("last_chunk")
+            if last_chunk:
+                _dbg(f"[more_detail] returning full last chunk file={last_chunk.get('file')}")
+                file = last_chunk.get("file", "")
+                page = last_chunk.get("page_start")
+                text = last_chunk.get("text", "")
+                citation = f"\n\n_Джерело: {file}"
+                if page:
+                    citation += f", стор. {page}"
+                citation += "._"
+                return {
+                    "response": text + citation,
+                    "category": "manual",
+                    "kb_entry_id": None,
+                    "confidence": 1.0,
+                    "source": "manual_full",
+                }
             _dbg("[more_detail] no last_entry → fallback")
             return self._fallback_response(
                 user_name,
@@ -137,22 +154,12 @@ class CoffeeBotAssistant:
 
         if is_negative_meta(user_query):
             _dbg("[triage] negative_meta → exclude last entry")
-            tried = set(conversation.get("tried_ids", []))
-            last_id = conversation.get("last_entry_id")
-            if last_id:
-                tried.add(last_id)
-            conversation["tried_ids"] = list(tried)
-            conversation["last_entry_id"] = None
+            self._mark_tried(conversation)
             return self._instant("negative_meta", negative_meta_reply(user_name))
 
         if is_followup_no(user_query):
             _dbg("[triage] followup_no → exclude last entry")
-            tried = set(conversation.get("tried_ids", []))
-            last_id = conversation.get("last_entry_id")
-            if last_id:
-                tried.add(last_id)
-            conversation["tried_ids"] = list(tried)
-            conversation["last_entry_id"] = None
+            self._mark_tried(conversation)
             return self._instant("followup_no", followup_no_reply(user_name))
 
         if is_followup_yes(user_query):
@@ -233,6 +240,22 @@ class CoffeeBotAssistant:
             "source": source,
         }
 
+    def _mark_tried(self, conversation: dict) -> None:
+        """Move last_entry_id and last_chunk into the tried-* sets."""
+        tried = set(conversation.get("tried_ids", []))
+        last_id = conversation.get("last_entry_id")
+        if last_id:
+            tried.add(last_id)
+        conversation["tried_ids"] = list(tried)
+        conversation["last_entry_id"] = None
+
+        last_chunk = conversation.get("last_chunk")
+        if last_chunk and last_chunk.get("chunk_id"):
+            tried_chunks = set(conversation.get("tried_chunk_ids", []))
+            tried_chunks.add(last_chunk["chunk_id"])
+            conversation["tried_chunk_ids"] = list(tried_chunks)
+        conversation["last_chunk"] = None
+
     def _try_chunk_fallback(
         self,
         user_query: str,
@@ -250,13 +273,29 @@ class CoffeeBotAssistant:
             if debug_log is not None:
                 debug_log.append(msg)
 
+        tried_chunk_ids = list(conversation.get("tried_chunk_ids", []))
         best = None
         tier = None  # "model" | "brand" | "universal"
         brand = _resolve_brand(machine_model, self.known_brands)
+        # Brand list was cached at boot. If a user references a brand we
+        # don't yet know about (post-boot ingest, manual transfer, etc.),
+        # re-list once and retry.
+        if brand is None and machine_model and machine_model != "universal":
+            try:
+                fresh = self.retriever.list_brands()
+            except Exception as exc:
+                fresh = []
+                _dbg(f"[retriever] list_brands refresh failed ({exc})")
+            if fresh and fresh != self.known_brands:
+                self.known_brands = fresh
+                brand = _resolve_brand(machine_model, self.known_brands)
+                _dbg(f"[retriever] brand list refreshed ({len(fresh)} brands), resolved={brand!r}")
 
         # Tier 1: exact model + universal chunks
         try:
-            hits = self.retriever.search_chunks(normalized, machine_model, k=3)
+            hits = self.retriever.search_chunks(
+                normalized, machine_model, k=3, exclude_chunk_ids=tried_chunk_ids or None
+            )
         except Exception as exc:
             _dbg(f"[retriever] tier1 search failed ({exc})")
             hits = []
@@ -272,7 +311,11 @@ class CoffeeBotAssistant:
         if best is None and brand:
             try:
                 bhits = self.retriever.search_chunks_by_brand(
-                    normalized, brand=brand, k=3, exclude_model=machine_model
+                    normalized,
+                    brand=brand,
+                    k=3,
+                    exclude_model=machine_model,
+                    exclude_chunk_ids=tried_chunk_ids or None,
                 )
             except Exception as exc:
                 _dbg(f"[retriever] tier2 search failed ({exc})")
@@ -285,10 +328,17 @@ class CoffeeBotAssistant:
                 if bhits[0].score >= self.chunk_threshold:
                     best, tier = bhits[0], "brand"
 
-        # Tier 3: universal (any brand). Only if no model and no brand hit yet.
-        if best is None:
+        # Tier 3: any brand. Skip when user has a known brand — surfacing a
+        # different vendor's instructions is worse than asking the user to
+        # clarify (W3 in the wiring audit).
+        if best is None and brand is None:
             try:
-                uhits = self.retriever.search_chunks(normalized, machine_model=None, k=3)
+                uhits = self.retriever.search_chunks(
+                    normalized,
+                    model=None,
+                    k=3,
+                    exclude_chunk_ids=tried_chunk_ids or None,
+                )
             except Exception as exc:
                 _dbg(f"[retriever] tier3 search failed ({exc})")
                 uhits = []
@@ -310,6 +360,7 @@ class CoffeeBotAssistant:
         ref_file = best.payload.get("file", "")
         page = best.payload.get("page_start")
         hit_model = best.payload.get("model")
+        chunk_id = best.payload.get("chunk_id")
 
         if tier == "model":
             citation = f"\n\n_Джерело: {ref_file}"
@@ -337,6 +388,13 @@ class CoffeeBotAssistant:
         response = f"{response}{citation}"
 
         conversation["last_entry_id"] = None
+        conversation["last_chunk"] = {
+            "chunk_id": chunk_id,
+            "file": ref_file,
+            "page_start": page,
+            "text": chunk_text,
+            "tier": tier,
+        }
         return {
             "response": response,
             "category": "manual",

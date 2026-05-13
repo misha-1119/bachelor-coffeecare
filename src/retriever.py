@@ -167,14 +167,45 @@ class VectorRetriever:
             ]
         )
 
-    def _brand_filter(self, brand: str, exclude_model: str | None = None):
+    def _brand_filter(
+        self,
+        brand: str,
+        exclude_model: str | None = None,
+        exclude_chunk_ids: list[str] | None = None,
+    ):
         from qdrant_client.http import models as qm
 
         must = [qm.FieldCondition(key="brand", match=qm.MatchValue(value=brand))]
-        must_not = None
+        must_not = []
         if exclude_model and exclude_model != "universal":
-            must_not = [qm.FieldCondition(key="model", match=qm.MatchValue(value=exclude_model))]
-        return qm.Filter(must=must, must_not=must_not)
+            must_not.append(qm.FieldCondition(key="model", match=qm.MatchValue(value=exclude_model)))
+        if exclude_chunk_ids:
+            must_not.append(
+                qm.FieldCondition(key="chunk_id", match=qm.MatchAny(any=list(exclude_chunk_ids)))
+            )
+        return qm.Filter(must=must, must_not=must_not or None)
+
+    def _chunks_model_filter(
+        self,
+        model: str | None,
+        exclude_chunk_ids: list[str] | None = None,
+    ):
+        from qdrant_client.http import models as qm
+
+        should = None
+        if model and model != "universal":
+            should = [
+                qm.FieldCondition(key="model", match=qm.MatchValue(value=model)),
+                qm.FieldCondition(key="model", match=qm.MatchValue(value="universal")),
+            ]
+        must_not = None
+        if exclude_chunk_ids:
+            must_not = [
+                qm.FieldCondition(key="chunk_id", match=qm.MatchAny(any=list(exclude_chunk_ids)))
+            ]
+        if should is None and must_not is None:
+            return None
+        return qm.Filter(should=should, must_not=must_not)
 
     def _search(self, collection: str, query: str, model: str | None, k: int) -> list[SearchHit]:
         vec = self.encode(query)
@@ -190,8 +221,22 @@ class VectorRetriever:
     def search_qa(self, query: str, model: str | None = None, k: int = 5) -> list[SearchHit]:
         return self._search(QA_COLLECTION, query, model, k)
 
-    def search_chunks(self, query: str, model: str | None = None, k: int = 3) -> list[SearchHit]:
-        return self._search(CHUNKS_COLLECTION, query, model, k)
+    def search_chunks(
+        self,
+        query: str,
+        model: str | None = None,
+        k: int = 3,
+        exclude_chunk_ids: list[str] | None = None,
+    ) -> list[SearchHit]:
+        vec = self.encode(query)
+        result = self.client.query_points(
+            collection_name=CHUNKS_COLLECTION,
+            query=vec.tolist(),
+            query_filter=self._chunks_model_filter(model, exclude_chunk_ids),
+            limit=k,
+            with_payload=True,
+        )
+        return [SearchHit(score=float(p.score), payload=dict(p.payload or {})) for p in result.points]
 
     def search_chunks_by_brand(
         self,
@@ -199,12 +244,15 @@ class VectorRetriever:
         brand: str,
         k: int = 3,
         exclude_model: str | None = None,
+        exclude_chunk_ids: list[str] | None = None,
     ) -> list[SearchHit]:
         vec = self.encode(query)
         result = self.client.query_points(
             collection_name=CHUNKS_COLLECTION,
             query=vec.tolist(),
-            query_filter=self._brand_filter(brand, exclude_model=exclude_model),
+            query_filter=self._brand_filter(
+                brand, exclude_model=exclude_model, exclude_chunk_ids=exclude_chunk_ids
+            ),
             limit=k,
             with_payload=True,
         )

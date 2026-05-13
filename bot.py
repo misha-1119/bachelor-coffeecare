@@ -132,7 +132,9 @@ def _get_assistant() -> CoffeeBotAssistant:
 def _get_rule_based() -> RuleBasedAssistant:
     global _rule_based
     if _rule_based is None:
-        _rule_based = RuleBasedAssistant(KnowledgeBase())
+        # Share the KB instance the NLP assistant already loaded so we don't pay
+        # the Convex/JSON load twice on cold start.
+        _rule_based = RuleBasedAssistant(_get_assistant().kb)
     return _rule_based
 
 
@@ -762,7 +764,16 @@ def _warmup():
     try:
         log.info("[warmup] loading classifier (liberta) + assistant...")
         assistant = _get_assistant()
-        log.info("[warmup] classifier ready (+%.2fs). Pinging Lapa...", time.monotonic() - t0)
+        log.info("[warmup] classifier ready (+%.2fs). Pinging Qdrant...", time.monotonic() - t0)
+        if assistant.retriever is not None:
+            try:
+                assistant.retriever.search_qa("warmup", model=None, k=1)
+                if assistant.known_brands:
+                    assistant.retriever.search_chunks("warmup", model=None, k=1)
+                log.info("[warmup] Qdrant warm (+%.2fs).", time.monotonic() - t0)
+            except Exception as e:
+                log.warning("[warmup] Qdrant ping failed: %s", e)
+        log.info("[warmup] pinging Lapa...")
         try:
             assistant.generator.generate(
                 user_query="тест",

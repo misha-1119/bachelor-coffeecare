@@ -139,7 +139,17 @@ class Classifier:
         machine_model: str | None,
         exclude_ids: set[str] | None,
     ) -> tuple[KBEntry | None, float]:
-        hits = self.retriever.search_qa(query, machine_model, k=10)
+        # pool=50: keyword boost can lift gold answers ranked 11+ by raw cosine
+        # (validated by evaluation/eval_retrieval.py — recall jumps when pool < 50)
+        try:
+            hits = self.retriever.search_qa(query, machine_model, k=50)
+        except Exception as exc:
+            print(f"[Classifier] retriever.search_qa failed ({exc}); reverting to numpy path")
+            self.retriever = None
+            if self.kb_embeddings is None:
+                self.is_manual = np.array([_is_manual_extract(e) for e in self.kb.entries], dtype=bool)
+                self.kb_embeddings = self._encode_kb()
+            return self._best_match_numpy(query, machine_model, exclude_ids)
         if not hits:
             return None, 0.0
         q_lower = query.lower()
