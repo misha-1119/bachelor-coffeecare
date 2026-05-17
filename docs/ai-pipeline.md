@@ -45,13 +45,15 @@ User message
 
 When QA confidence is below `CONFIDENCE_THRESHOLD` (0.55), assistant tries `kb_chunks`:
 
-| Tier | Filter | Citation format |
-|------|--------|-----------------|
-| 1 | `model == user_slug OR universal` | `Джерело: <file>, стор. N` |
-| 2 | `brand == <derived>`, excluding tier-1 model | `Джерело зі схожої моделі (<hit_model>): <file>, стор. N` |
-| 3 | none (any model) | `Джерело: <file>, стор. N` |
+| Tier | Filter | When it runs | Citation format |
+|------|--------|--------------|-----------------|
+| 1 | `model == user_slug OR universal` | always | `Джерело: <file>, стор. N` |
+| 2 | `brand == <derived>`, excluding tier-1 model | brand resolved from user model slug | `Джерело зі схожої моделі (<hit_model>): <file>, стор. N` |
+| 3 | none (any model) | **only when no brand resolved** — surfacing a different vendor's instructions to a user with a known machine is worse than asking them to clarify | `Джерело: <file>, стор. N` |
 
-Cascade stops at the first tier with `best.score ≥ CHUNK_THRESHOLD` (env-tunable, default 0.45). Brand is derived from the user's model slug via longest-prefix match against `retriever.list_brands()` cached at boot.
+Cascade stops at the first tier with `best.score ≥ CHUNK_THRESHOLD` (env-tunable, default 0.45). Brand is derived from the user's model slug via longest-prefix match against `retriever.list_brands()` cached at boot; if a user references a brand we don't yet know about (post-boot ingest), the cache is re-listed once.
+
+The cascade also honours `tried_chunk_ids` from the conversation state: chunks the user already saw via the "не спрацювало" flow are excluded with a Qdrant `must_not` filter on `chunk_id`.
 
 ## Stage 2: Generator (Lapa LLM)
 
@@ -66,6 +68,9 @@ Cascade stops at the first tier with `best.score ≥ CHUNK_THRESHOLD` (env-tunab
   - Address user by name once (if known).
   - End with an open question ("Допомогло?", "Що показує машина?").
   - Never invent facts outside the retrieved instruction.
+- **Two prompt variants** (chosen by `category`):
+  - `category != "manual"` — instruction is a curated KB answer; tail asks for a 2–4 sentence rephrase.
+  - `category == "manual"` — instruction is a raw PDF chunk; tail asks for 2–4 short steps and forces the model to admit when the chunk doesn't actually answer the query (avoids confidently misreading a manual page).
 - **Offline fallback**: returns first paragraph of KB answer (or chunk text for manual hits), truncated to 320 chars.
 
 ## Triage Rules
@@ -76,7 +81,7 @@ Cascade stops at the first tier with `best.score ≥ CHUNK_THRESHOLD` (env-tunab
 | Goodbye (дякую, bye, ...) | Closing reply |
 | "допомогло" / yes | Positive acknowledgement |
 | "не спрацювало" / no | Mark last entry as tried, offer retry |
-| "детальніше" / more detail | Return full KB answer for last entry |
+| "детальніше" / more detail | Return full KB answer for last entry, or the full PDF chunk + page citation if the last hit was from `kb_chunks` |
 | Urgent safety keywords | Immediate "unplug the machine" safety reply |
 | Negative meta ("не те", "ти не допоміг") | Acknowledge, re-ask |
 

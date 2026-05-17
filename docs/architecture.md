@@ -88,4 +88,6 @@
 
 ## Concurrency note
 
-Local Qdrant holds an **exclusive file lock** on `data/qdrant/`. The bot cannot run while `scripts/ingest_kb.py` or `scripts/ingest_pdfs.py` are active. If the retriever can't open the DB at boot, the assistant silently falls back to the legacy in-memory numpy path over `KnowledgeBase`.
+Local Qdrant holds an **exclusive file lock** on `data/qdrant/`. The bot cannot run while `scripts/ingest_kb.py` or `scripts/ingest_pdfs.py` are active.
+
+If the retriever can't open the DB at boot, the assistant silently falls back to the legacy in-memory numpy path over `KnowledgeBase`. The classifier additionally guards every `search_qa` call with try/except: if a request fails mid-flight (lock contention, disk error), the classifier downgrades itself to the numpy path for the rest of the process lifetime so the user's request still gets an answer.
