@@ -15,14 +15,14 @@ import asyncio
 import logging
 import threading
 import time
+import traceback
 
 from dotenv import load_dotenv
 from telegram import (
     Update,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
+    ReplyKeyboardRemove,
     BotCommand,
 )
 from telegram.constants import ChatAction
@@ -117,6 +117,39 @@ async def _live_debug_pump(bot, chat_id: int, steps: list[str], started_at: floa
 def _html_escape(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
+
+TG_MSG_LIMIT = 4096
+
+
+def _split_for_telegram(text: str, limit: int = TG_MSG_LIMIT) -> list[str]:
+    if len(text) <= limit:
+        return [text]
+    parts: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        cut = remaining.rfind("\n\n", 0, limit)
+        if cut == -1:
+            cut = remaining.rfind("\n", 0, limit)
+        if cut == -1:
+            cut = remaining.rfind(" ", 0, limit)
+        if cut == -1 or cut < limit // 2:
+            cut = limit
+        parts.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip()
+    if remaining:
+        parts.append(remaining)
+    return parts
+
+
+async def _send_long(send_fn, text: str, **kwargs):
+    chunks = _split_for_telegram(text)
+    reply_markup = kwargs.pop("reply_markup", None)
+    for idx, chunk in enumerate(chunks):
+        if idx == len(chunks) - 1 and reply_markup is not None:
+            await send_fn(chunk, reply_markup=reply_markup, **kwargs)
+        else:
+            await send_fn(chunk, **kwargs)
+
 _assistant: CoffeeBotAssistant | None = None
 _rule_based: RuleBasedAssistant | None = None
 _user_repo: UserRepository | None = None
@@ -151,11 +184,6 @@ def _ensure_state(user_id: int) -> dict:
         state = {"model": None, "stage": "ready"}
         USER_STATE[user_id] = state
     return state
-
-
-RKB_MENU = "☰ Меню"
-RKB_PROFILE = "👤 Профіль"
-RKB_OTHER = "🔄 Інша проблема"
 
 
 def _kb_step1() -> InlineKeyboardMarkup:
@@ -202,15 +230,14 @@ def _kb_back_to_categories() -> InlineKeyboardMarkup:
     ])
 
 
-def _reply_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
+def _kb_profile() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("☕ Змінити кавомашину", callback_data="action:change_machine")],
         [
-            [KeyboardButton(RKB_MENU), KeyboardButton(RKB_PROFILE)],
-            [KeyboardButton(RKB_OTHER)],
+            InlineKeyboardButton("Інша проблема", callback_data="action:other_problem"),
+            InlineKeyboardButton("Головне меню", callback_data="action:menu"),
         ],
-        resize_keyboard=True,
-        is_persistent=True,
-    )
+    ])
 
 
 async def _send_welcome(send_fn, user_id: int, username: str | None):
@@ -231,7 +258,7 @@ async def _send_welcome(send_fn, user_id: int, username: str | None):
         state["stage"] = "awaiting_name"
         await send_fn(
             "Привіт! Я CoffeeCare.\nЯк до вас звертатись?",
-            reply_markup=_reply_kb(),
+            reply_markup=ReplyKeyboardRemove(),
         )
         return
 
@@ -239,7 +266,7 @@ async def _send_welcome(send_fn, user_id: int, username: str | None):
         await send_fn(
             f"Привіт, {name}! Я CoffeeCare.\n"
             "Для точнішої відповіді — вкажіть модель кавомашини:",
-            reply_markup=_reply_kb(),
+            reply_markup=ReplyKeyboardRemove(),
         )
         await send_fn(
             "Оберіть, як продовжити:",
@@ -249,7 +276,7 @@ async def _send_welcome(send_fn, user_id: int, username: str | None):
         await send_fn(
             f"Привіт, {name}! Я CoffeeCare.\n"
             f"Ваша кавомашина: {_display_machine(machine)}.\nЩо сталось?",
-            reply_markup=_reply_kb(),
+            reply_markup=ReplyKeyboardRemove(),
         )
         await send_fn(
             "Оберіть категорію проблеми:",
@@ -348,7 +375,7 @@ async def _show_profile(send_fn, user_id: int, username: str | None):
     user_row = repo.get_user(user_id)
     state = _ensure_state(user_id)
     text = _format_profile(user_row, state)
-    await send_fn(text, reply_markup=_kb_post_answer())
+    await send_fn(text, reply_markup=_kb_profile())
 
 
 async def cmd_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -377,7 +404,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/help — ця довідка\n\n"
         "Напишіть проблему звичайним текстом — підкажу рішення."
     )
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=_reply_kb())
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
 async def cmd_eval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -412,6 +439,20 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         state["stage"] = "awaiting_model"
         await query.edit_message_text(
             "Напишіть бренд і модель вашої кавомашини. Напр.:\n"
+            "  • DeLonghi Magnifica S\n"
+            "  • Philips 3200 LatteGo\n"
+            "  • Jura E8\n\n"
+            "Або «не знаю» — відповідатиму загальними інструкціями.",
+            reply_markup=_kb_skip_model(),
+        )
+
+    elif data == "action:change_machine":
+        state["stage"] = "awaiting_model"
+        state["model"] = None
+        state["hint_category"] = None
+        USER_CONVERSATION.pop(user_id, None)
+        await query.message.reply_text(
+            "Напишіть нову модель кавомашини. Напр.:\n"
             "  • DeLonghi Magnifica S\n"
             "  • Philips 3200 LatteGo\n"
             "  • Jura E8\n\n"
@@ -458,7 +499,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             kb = _get_assistant().kb
             entry = next((e for e in kb.entries if e.id == last_id), None)
             if entry:
-                await query.message.reply_text(entry.answer, reply_markup=_kb_post_answer())
+                await _send_long(query.message.reply_text, entry.answer, reply_markup=_kb_post_answer())
                 return
         await query.message.reply_text(
             "Поки немає деталей до попередньої відповіді. Опишіть проблему детальніше — спробую знайти точніше рішення.",
@@ -515,30 +556,13 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         debug_steps.append(f"[on_message] user={user_id} text={text!r}")
         debug_steps.append(f"[state] stage={state.get('stage')} model={state.get('model')!r} name={state.get('name')!r}")
 
-    stripped = text.strip()
-    if stripped in {RKB_MENU, RKB_PROFILE, RKB_OTHER} and state.get("stage") != "awaiting_name":
-        if stripped == RKB_MENU:
-            USER_CONVERSATION.pop(user_id, None)
-            await _send_welcome(update.message.reply_text, user_id, update.effective_user.username)
-            return
-        if stripped == RKB_PROFILE:
-            await _show_profile(update.message.reply_text, user_id, update.effective_user.username)
-            return
-        if stripped == RKB_OTHER:
-            USER_CONVERSATION.pop(user_id, None)
-            state["hint_category"] = None
-            state["stage"] = "ready"
-            await update.message.reply_text("Добре. Що ще сталося?", reply_markup=_kb_step2())
-            return
-
     if state.get("stage") == "awaiting_name":
         if debug_on:
             debug_steps.append("[flow] awaiting_name branch")
         name = _normalize_name(text)
         if not name:
             await update.message.reply_text(
-                "Напишіть, будь ласка, ім'я (1–30 символів).",
-                reply_markup=_reply_kb(),
+                "Напишіть, будь ласка, ім'я (1–30 символів)."
             )
             await _send_debug(update.message.reply_text, user_id, debug_steps + ["[flow] empty name → reprompt"])
             return
@@ -551,8 +575,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not machine or machine == "universal":
             await update.message.reply_text(
                 f"Приємно познайомитись, {name}!\n"
-                "Додайте кавомашину для точніших відповідей:",
-                reply_markup=_reply_kb(),
+                "Додайте кавомашину для точніших відповідей:"
             )
             await update.message.reply_text(
                 "Оберіть, як продовжити:",
@@ -561,8 +584,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(
                 f"Приємно познайомитись, {name}!\n"
-                f"Ваша кавомашина: {_display_machine(machine)}.\nЩо сталось?",
-                reply_markup=_reply_kb(),
+                f"Ваша кавомашина: {_display_machine(machine)}.\nЩо сталось?"
             )
             await update.message.reply_text(
                 "Оберіть категорію проблеми:",
@@ -656,6 +678,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             _live_debug_pump(ctx.bot, update.effective_chat.id, debug_steps, started_at)
         )
 
+    respond_failed = False
     try:
         if mode == "rule_based":
             result = await asyncio.to_thread(_get_rule_based().respond, text)
@@ -671,6 +694,18 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 user_bio,
                 debug_steps if debug_on else None,
             )
+    except Exception as e:
+        log.exception("respond() failed for user %s: %s", user_id, e)
+        if debug_on:
+            debug_steps.append(f"[error] {type(e).__name__}: {e}")
+        result = {
+            "response": "Не вдалося обробити запит. Спробуйте перефразувати або /reset.",
+            "source": "error",
+            "category": None,
+            "confidence": 0.0,
+            "kb_entry_id": None,
+        }
+        respond_failed = True
     finally:
         if pump_task is not None:
             pump_task.cancel()
@@ -682,7 +717,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if debug_on:
         debug_steps.append(f"[result] +{time.monotonic() - started_at:.2f}s source={result.get('source')} cat={result.get('category')} conf={result.get('confidence')} kb={result.get('kb_entry_id')}")
 
-    await update.message.reply_text(result["response"], reply_markup=_kb_post_answer())
+    await _send_long(update.message.reply_text, result["response"], reply_markup=_kb_post_answer())
     await _send_debug(update.message.reply_text, user_id, debug_steps)
 
 
@@ -741,10 +776,31 @@ def start_bot():
     app.add_handler(CommandHandler("profile", cmd_profile))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    app.add_error_handler(on_error)
 
     log.info("Bot starting... DEBUG_MODE=%s", os.getenv("DEBUG_MODE", "0"))
     threading.Thread(target=_warmup, daemon=True, name="warmup").start()
     app.run_polling()
+
+
+async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    err = ctx.error
+    tb = "".join(traceback.format_exception(type(err), err, err.__traceback__)) if err else ""
+    log.error("Unhandled exception in handler: %s\n%s", err, tb)
+    chat_id = None
+    if isinstance(update, Update):
+        if update.effective_chat:
+            chat_id = update.effective_chat.id
+    if chat_id is None:
+        return
+    try:
+        await ctx.bot.send_message(
+            chat_id=chat_id,
+            text="Сталася технічна помилка. Спробуйте ще раз або /reset.",
+            reply_markup=_kb_post_answer(),
+        )
+    except Exception as e:
+        log.warning("Failed to notify user about error: %s", e)
 
 
 async def _post_init(app: Application) -> None:
