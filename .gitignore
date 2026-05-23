@@ -10,4 +10,6 @@ convex/_generated/
 data/manuals/**/*.pdf
 data/manuals/_parsed/
 data/qdrant/
+data/vectors/*.npy
+data/vectors/*.jsonl
 /.claude

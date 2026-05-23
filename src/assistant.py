@@ -170,6 +170,11 @@ class CoffeeBotAssistant:
             _dbg("[triage] urgent_safety")
             return self._instant("safety", urgent_safety_reply(user_name))
 
+        pending_clarify = conversation.pop("pending_clarify_query", None)
+        if pending_clarify:
+            user_query = f"{pending_clarify}. {user_query}"
+            _dbg(f"[clarify] merged pending clarify → {user_query!r}")
+
         normalized = normalize(user_query)
         _dbg(f"[normalize] {normalized!r}")
 
@@ -208,6 +213,7 @@ class CoffeeBotAssistant:
 
         if category == "clarify":
             _dbg("[assistant] category=clarify → kb_direct")
+            conversation["pending_clarify_query"] = user_query
             text = entry.answer
             if user_name and not text.lower().startswith(user_name.lower()):
                 text = f"{user_name}, {text[0].lower()}{text[1:]}"

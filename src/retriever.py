@@ -47,10 +47,17 @@ class VectorRetriever:
         from qdrant_client import QdrantClient
 
         self.encoder = encoder
-        self.db_path = db_path or os.getenv("QDRANT_PATH", DEFAULT_DB_PATH)
-        Path(self.db_path).mkdir(parents=True, exist_ok=True)
         self.vector_size = vector_size or _encoder_dim(encoder)
-        self.client = QdrantClient(path=self.db_path)
+
+        qdrant_url = os.getenv("QDRANT_URL")
+        if qdrant_url:
+            self.db_path = None
+            self.client = QdrantClient(url=qdrant_url, timeout=120)
+        else:
+            self.db_path = db_path or os.getenv("QDRANT_PATH", DEFAULT_DB_PATH)
+            Path(self.db_path).mkdir(parents=True, exist_ok=True)
+            self.client = QdrantClient(path=self.db_path)
+
         self._cached_encode = lru_cache(maxsize=512)(self._encode_raw)
 
     def _encode_raw(self, text: str) -> tuple[float, ...]:

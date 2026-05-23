@@ -1,0 +1,18 @@
+.git
+.env
+__pycache__
+*.pyc
+*.pyo
+*.log
+node_modules
+
+# large runtime data — mounted as volumes
+data/qdrant/
+data/manuals/
+
+# dev-only directories
+evaluation/
+scripts/
+docs/
+convex/
+docker/

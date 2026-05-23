@@ -36,7 +36,7 @@ from telegram.ext import (
 )
 
 from src.knowledge_base import KnowledgeBase
-from src.assistant import CoffeeBotAssistant
+from src.assistant import CoffeeBotAssistant, _resolve_brand
 from src.rule_based import RuleBasedAssistant
 from src.user_repository import UserRepository
 from src.bio_generator import generate_bio
@@ -224,6 +224,13 @@ def _kb_skip_model() -> InlineKeyboardMarkup:
     ])
 
 
+def _kb_unknown_brand() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Загальні поради", callback_data="action:skip_machine"),
+         InlineKeyboardButton("Ввести іншу", callback_data="action:retry_model")],
+    ])
+
+
 def _kb_back_to_categories() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("↩️ Назад до категорій", callback_data="action:back_to_categories")],
@@ -242,8 +249,8 @@ def _kb_profile() -> InlineKeyboardMarkup:
 
 async def _send_welcome(send_fn, user_id: int, username: str | None):
     repo = _get_user_repo()
-    repo.upsert_user(user_id, username)
-    row = repo.get_user(user_id) or {}
+    await asyncio.to_thread(repo.upsert_user, user_id, username)
+    row = await asyncio.to_thread(repo.get_user, user_id) or {}
     name = row.get("name")
     machine = row.get("machine")
 
@@ -371,8 +378,8 @@ def _format_profile(user_row: dict | None, state: dict) -> str:
 
 async def _show_profile(send_fn, user_id: int, username: str | None):
     repo = _get_user_repo()
-    repo.upsert_user(user_id, username)
-    user_row = repo.get_user(user_id)
+    await asyncio.to_thread(repo.upsert_user, user_id, username)
+    user_row = await asyncio.to_thread(repo.get_user, user_id)
     state = _ensure_state(user_id)
     text = _format_profile(user_row, state)
     await send_fn(text, reply_markup=_kb_profile())
@@ -469,6 +476,13 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=_kb_step2(),
         )
 
+    elif data == "action:retry_model":
+        state["stage"] = "awaiting_model"
+        await query.edit_message_text(
+            "Введіть марку та модель кавомашини (наприклад, Philips EP2231, DeLonghi Magnifica):",
+            reply_markup=_kb_skip_model(),
+        )
+
     elif data.startswith("category:"):
         category = data.split(":", 1)[1]
         state["hint_category"] = category
@@ -501,6 +515,17 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if entry:
                 await _send_long(query.message.reply_text, entry.answer, reply_markup=_kb_post_answer())
                 return
+        last_chunk = conversation.get("last_chunk")
+        if last_chunk and last_chunk.get("text"):
+            text = last_chunk["text"]
+            file = last_chunk.get("file", "")
+            page = last_chunk.get("page_start")
+            citation = f"\n\n_Джерело: {file}"
+            if page:
+                citation += f", стор. {page}"
+            citation += "._"
+            await _send_long(query.message.reply_text, text + citation, reply_markup=_kb_post_answer())
+            return
         await query.message.reply_text(
             "Поки немає деталей до попередньої відповіді. Опишіть проблему детальніше — спробую знайти точніше рішення.",
             reply_markup=_kb_post_answer(),
@@ -548,7 +573,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     state = _ensure_state(user_id)
     repo = _get_user_repo()
-    repo.upsert_user(user_id, update.effective_user.username)
+    await asyncio.to_thread(repo.upsert_user, user_id, update.effective_user.username)
 
     debug_on = _debug_enabled(user_id)
     debug_steps: list[str] = []
@@ -568,7 +593,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         state["name"] = name
         state["stage"] = "ready"
-        repo.set_name(user_id, name)
+        await asyncio.to_thread(repo.set_name, user_id, name)
         if debug_on:
             debug_steps.append(f"[repo] set_name={name!r}")
         machine = state.get("model")
@@ -599,7 +624,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if _looks_like_skip(text):
             state["model"] = "universal"
             state["stage"] = "ready"
-            repo.set_machine(user_id, "universal")
+            await asyncio.to_thread(repo.set_machine, user_id, "universal")
             if debug_on:
                 debug_steps.append("[flow] looks_like_skip → universal")
             await update.message.reply_text(
@@ -611,14 +636,31 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if _looks_like_question(text):
             state["model"] = state.get("model") or "universal"
             state["stage"] = "ready"
-            repo.set_machine(user_id, state["model"])
+            await asyncio.to_thread(repo.set_machine, user_id, state["model"])
             if debug_on:
                 debug_steps.append(f"[flow] looks_like_question → model={state['model']!r}, fall through to respond")
         else:
             normalized_model = _normalize_model_input(text)
+            assistant = _get_assistant()
+            if (
+                normalized_model != "universal"
+                and assistant.known_brands
+                and _resolve_brand(normalized_model, assistant.known_brands) is None
+            ):
+                if debug_on:
+                    debug_steps.append(f"[flow] unknown brand slug={normalized_model!r} known={assistant.known_brands}")
+                display = _display_machine(normalized_model)
+                await update.message.reply_text(
+                    f"Не знайшов інструкцій для «{display}». "
+                    "Можу відповідати загальними порадами, або введіть іншу модель "
+                    "(наприклад, Philips EP2231, DeLonghi Magnifica).",
+                    reply_markup=_kb_unknown_brand(),
+                )
+                await _send_debug(update.message.reply_text, user_id, debug_steps)
+                return
             state["model"] = normalized_model
             state["stage"] = "ready"
-            repo.set_machine(user_id, normalized_model)
+            await asyncio.to_thread(repo.set_machine, user_id, normalized_model)
             if debug_on:
                 debug_steps.append(f"[repo] set_machine={normalized_model!r}")
             label = _display_machine(normalized_model) if normalized_model != "universal" else None
@@ -637,11 +679,11 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     buf = USER_MESSAGES.setdefault(user_id, [])
     if len(buf) < BIO_TRIGGER_AT:
         buf.append(text)
-    count = repo.increment_message_count(user_id)
+    count = await asyncio.to_thread(repo.increment_message_count, user_id)
     if debug_on:
         debug_steps.append(f"[repo] increment_message_count → {count}")
 
-    user_row = repo.get_user(user_id)
+    user_row = await asyncio.to_thread(repo.get_user, user_id)
     user_bio = user_row.get("bio") if user_row else None
     if not state.get("name") and user_row and user_row.get("name"):
         state["name"] = user_row["name"]
@@ -659,9 +701,9 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ):
         if debug_on:
             debug_steps.append(f"[bio] generating (count={count} buf={len(buf)})")
-        bio = generate_bio(buf, machine=model)
+        bio = await asyncio.to_thread(lambda: generate_bio(buf, machine=model))
         if bio:
-            repo.set_bio(user_id, bio)
+            await asyncio.to_thread(repo.set_bio, user_id, bio)
             user_bio = bio
             if debug_on:
                 debug_steps.append(f"[bio] saved len={len(bio)}")
