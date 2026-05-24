@@ -29,8 +29,9 @@ def main() -> int:
     from qdrant_client.http import models as qm
 
     qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
+    qdrant_api_key = os.getenv("QDRANT_API_KEY")
     print(f"[upload] connecting to {qdrant_url}")
-    client = QdrantClient(url=qdrant_url, timeout=120)
+    client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key, timeout=120)
     client.get_collections()  # sanity check
     print("[upload] Qdrant OK")
 

@@ -24,7 +24,7 @@ from src.triage import (
     negative_meta_reply,
 )
 
-CONFIDENCE_THRESHOLD = 0.65
+CONFIDENCE_THRESHOLD = 1.0  # only error-code regex hits (conf=1.0) use KB directly; all else → chunks
 MIN_MEANINGFUL_LEN = 4
 
 

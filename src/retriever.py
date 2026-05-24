@@ -52,7 +52,11 @@ class VectorRetriever:
         qdrant_url = os.getenv("QDRANT_URL")
         if qdrant_url:
             self.db_path = None
-            self.client = QdrantClient(url=qdrant_url, timeout=120)
+            self.client = QdrantClient(
+                url=qdrant_url,
+                api_key=os.getenv("QDRANT_API_KEY"),
+                timeout=120,
+            )
         else:
             self.db_path = db_path or os.getenv("QDRANT_PATH", DEFAULT_DB_PATH)
             Path(self.db_path).mkdir(parents=True, exist_ok=True)
