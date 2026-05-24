@@ -12,4 +12,7 @@ COPY src/ src/
 COPY data/knowledge_base.json data/knowledge_base.json
 COPY main.py bot.py ./
 
+# Pre-download liberta-large so cold starts don't re-fetch from HuggingFace
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('Goader/liberta-large')"
+
 CMD ["python", "main.py", "bot"]
