@@ -23,19 +23,22 @@ Two layers serve different jobs:
 |-------|---------|----------|------------|
 | **Convex `kb_entries`** | Source of truth, edited live | All 290 entries | `seed_convex.py`, `add_kb_entry.py` |
 | **JSON `data/knowledge_base.json`** | Local fallback when Convex is down | Same 290 entries | git-tracked |
-| **Qdrant `kb_qa`** | Runtime semantic index | ~72 curated entries (manual-extracts excluded) | `scripts/ingest_kb.py` |
-| **Qdrant `kb_chunks`** | Runtime fallback for PDF content | Thousands of PDF chunks | `scripts/ingest_pdfs.py` |
+| **Qdrant `kb_qa`** | Error-code override path | ~72 curated entries (manual-extracts excluded) | `scripts/ingest_kb.py` |
+| **Qdrant `kb_chunks`** | Primary retrieval path | 71,869 PDF manual chunks | `scripts/ingest_pdfs.py` / `scripts/upload_vectors.py` |
 
-Convex remains the canonical source. The two Qdrant collections are derived caches — drop and rebuild from `ingest_kb.py` / `ingest_pdfs.py`. Bot connects to:
-- Convex: `https://elated-ibis-809.eu-west-1.convex.cloud`.
-- Convex functions: `kb:listEntries`, `kb:listCategories`, `kb:getByCategory`, `kb:getByModel`.
-- Qdrant: local file-backed DB at `data/qdrant/` (path overridable via `QDRANT_PATH`).
+Convex remains the canonical source. The two Qdrant collections are derived caches hosted on Qdrant Cloud. Bot connects to:
+- Convex: `https://elated-ibis-809.eu-west-1.convex.cloud` (configured via `CONVEX_URL` env var).
+- Qdrant Cloud: `eu-central-1-0.aws.cloud.qdrant.io` (configured via `QDRANT_URL` + `QDRANT_API_KEY`).
+
+## Retrieval Path
+
+`kb_qa` is used **only** when an error-code regex fires (`CONFIDENCE_THRESHOLD = 1.0`). All other queries go directly to the chunk cascade over `kb_chunks`. This means `kb_qa` acts as a precision override for known error codes, while 71,869 manual chunks handle all other queries.
 
 ## Stats
 
 - **290 entries** total in Convex / JSON.
 - **~72 entries** indexed into `kb_qa` (curated only — see "Manual-extract filter" below).
-- **~thousands of chunks** in `kb_chunks` after full PDF ingest (one chunk per ~600 tokens of manual text).
+- **71,869 chunks** in `kb_chunks` (full PDF ingest, table-aware extraction).
 - **9 categories**.
 - **81 unique machine models** + `universal` entries (apply to all machines).
 - **21 brands** with PDF manuals (derived from `data/manuals/<brand>/` directories; queryable via `retriever.list_brands()`).
@@ -54,18 +57,18 @@ Convex remains the canonical source. The two Qdrant collections are derived cach
 | `grinding` | 5 | Grinder jams, adjustment, noise |
 | `no_coffee` | 1 | Machine not producing coffee |
 
-A `manual` "virtual category" is emitted at runtime when the answer comes from `kb_chunks` rather than a curated entry.
+A `manual` virtual category is emitted at runtime when the answer comes from `kb_chunks` rather than a curated entry.
 
 ## Manual-extract filter
 
-Entries auto-generated from PDF sections (id suffixes `_specs`, `_settings`, `_cleaning_uk`, `_cleaning_en`, `_brewing_001`, or with `"Інструкція для"` boilerplate in question/answer) are excluded from `kb_qa` by `Classifier._is_manual_extract`. The reason: those entries are noisy and used to hijack short queries via spurious semantic similarity. The same content is now indexed at chunk granularity in `kb_chunks` and surfaced through the cascade described in `ai-pipeline.md`.
+Entries auto-generated from PDF sections (id suffixes `_specs`, `_settings`, `_cleaning_uk`, `_cleaning_en`, `_brewing_001`, or with `"Інструкція для"` boilerplate in question/answer) are excluded from `kb_qa` by `Classifier._is_manual_extract`. The same content is indexed at chunk granularity in `kb_chunks` and surfaced through the cascade.
 
 ## Keywords
 
 Each entry has multilingual keywords (Ukrainian + Russian + English) for broad matching:
 - `"E01"`, `"помилка E01"`, `"ошибка E01"`, `"error E01"`, `"overheat"`.
 
-This allows users to write in any mix of languages and still match correctly. The keyword boost is applied on top of the Qdrant cosine score in the classifier.
+The keyword boost is applied on top of the Qdrant cosine score in the classifier.
 
 ## Model Field
 
@@ -73,6 +76,10 @@ This allows users to write in any mix of languages and still match correctly. Th
 - Specific slug (e.g. `"delonghi_magnifica_s"`) — model-specific advice.
 - Classifier pushes the model filter into Qdrant; the user's machine model and `universal` are surfaced first.
 - Chunk fallback derives the **brand** from the model slug via longest-prefix match against `retriever.list_brands()` (e.g. `russell_hobbs_24370` → `russell_hobbs`).
+
+## Brand Validation
+
+When a user enters their machine model during onboarding, the bot resolves the brand via longest-prefix match against `assistant.known_brands`. If the brand is unknown (e.g. "Samsung"), the bot rejects the input with a friendly message and offers to use `universal` mode instead. This prevents silently accepting non-coffee-machine brands and then serving mismatched manual content.
 
 ## How to Add Entries
 
@@ -89,6 +96,6 @@ python3 scripts/manual_to_kb.py --brand delonghi
 # After editing knowledge_base.json manually:
 python3 scripts/seed_convex.py
 
-# Rebuild Qdrant after any KB change
+# Rebuild kb_qa in Qdrant after any KB change
 python3 scripts/ingest_kb.py
 ```
