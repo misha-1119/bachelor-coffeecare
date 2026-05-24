@@ -24,7 +24,7 @@ from src.triage import (
     negative_meta_reply,
 )
 
-CONFIDENCE_THRESHOLD = 0.55
+CONFIDENCE_THRESHOLD = 0.65
 MIN_MEANINGFUL_LEN = 4
 
 
