@@ -91,7 +91,9 @@ class Classifier:
     def _error_code_override(self, query: str, machine_model: str | None = None) -> KBEntry | None:
         """If the query mentions E01-E20 etc., always return the matching KB entry.
         Prefers a model-specific entry over a universal one when available."""
-        m = ERROR_CODE_RE.search(query)
+        # Normalize Cyrillic homoglyphs (Е→E, А→A) so regex works on UA input
+        query_norm = query.replace("Е", "E").replace("е", "e").replace("А", "A").replace("а", "a")
+        m = ERROR_CODE_RE.search(query_norm)
         if not m:
             return None
         code_num = m.group(1).zfill(2)

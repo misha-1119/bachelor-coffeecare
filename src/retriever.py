@@ -21,6 +21,41 @@ VECTOR_SIZE = 1024
 DEFAULT_DB_PATH = "./data/qdrant"
 _UUID_NAMESPACE = uuid.UUID("c0ffee00-0000-0000-0000-000000000001")
 
+_MIN_CHUNK_LEN = 40   # chars — filters table-cell noise like "250г" or "milk"
+_MIN_UA_RATIO = 0.30  # fraction of alpha chars that must be Cyrillic
+_MIN_UA_SPECIFIC = 0.015  # fraction of alpha chars that must be uniquely Ukrainian (і, ї, є, ґ)
+_UA_UNIQUE = frozenset("іїєґІЇЄҐ")  # letters absent from Russian/Macedonian/Bulgarian
+
+
+def _ua_ratio(text: str) -> float:
+    """Fraction of alphabetic chars that are Cyrillic (UA/RU)."""
+    alpha = [c for c in text if c.isalpha()]
+    if not alpha:
+        return 1.0
+    return sum(1 for c in alpha if "Ѐ" <= c <= "ӿ") / len(alpha)
+
+
+def _ua_specific_ratio(text: str) -> float:
+    """Fraction of alphabetic chars that are uniquely Ukrainian (і, ї, є, ґ).
+    Russian, Macedonian, Bulgarian don't use these letters → filters cross-language noise."""
+    alpha = [c for c in text if c.isalpha()]
+    if not alpha:
+        return 0.0
+    return sum(1 for c in alpha if c in _UA_UNIQUE) / len(alpha)
+
+
+def _is_coherent(text: str) -> bool:
+    """Reject garbled PDF parse: too many short word-fragments (word endings / OCR noise).
+
+    Corrupted example: 'сть . ві ати:. з молоком. дповідає кно тепер повер'
+    In valid UA text, ≤ 35% of words are 1-3 chars; corrupted text routinely hits 50%+.
+    """
+    words = [w for w in re.split(r"[\s.,;:()\[\]]+", text) if w.isalpha()]
+    if len(words) < 4:
+        return True  # too few tokens to judge
+    short = sum(1 for w in words if len(w) <= 3)
+    return short / len(words) < 0.45
+
 
 def stable_id(key: str) -> str:
     return str(uuid.uuid5(_UUID_NAMESPACE, key))
@@ -218,6 +253,29 @@ class VectorRetriever:
             return None
         return qm.Filter(should=should, must_not=must_not)
 
+    def _filter_chunks(self, hits: list[SearchHit], k: int) -> list[SearchHit]:
+        """Remove short/non-UA/corrupted/duplicate chunks, return top-k survivors."""
+        seen: set[str] = set()
+        result: list[SearchHit] = []
+        for h in hits:
+            text = (h.payload.get("text") or "").strip()
+            if len(text) < _MIN_CHUNK_LEN:
+                continue
+            if _ua_ratio(text) < _MIN_UA_RATIO:
+                continue
+            if _ua_specific_ratio(text) < _MIN_UA_SPECIFIC:
+                continue
+            if not _is_coherent(text):
+                continue
+            key = text[:120]
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(h)
+            if len(result) == k:
+                break
+        return result
+
     def _search(self, collection: str, query: str, model: str | None, k: int) -> list[SearchHit]:
         vec = self.encode(query)
         result = self.client.query_points(
@@ -244,10 +302,11 @@ class VectorRetriever:
             collection_name=CHUNKS_COLLECTION,
             query=vec.tolist(),
             query_filter=self._chunks_model_filter(model, exclude_chunk_ids),
-            limit=k,
+            limit=min(k * 8, 80),
             with_payload=True,
         )
-        return [SearchHit(score=float(p.score), payload=dict(p.payload or {})) for p in result.points]
+        raw = [SearchHit(score=float(p.score), payload=dict(p.payload or {})) for p in result.points]
+        return self._filter_chunks(raw, k)
 
     def search_chunks_by_brand(
         self,
@@ -264,10 +323,11 @@ class VectorRetriever:
             query_filter=self._brand_filter(
                 brand, exclude_model=exclude_model, exclude_chunk_ids=exclude_chunk_ids
             ),
-            limit=k,
+            limit=min(k * 8, 80),
             with_payload=True,
         )
-        return [SearchHit(score=float(p.score), payload=dict(p.payload or {})) for p in result.points]
+        raw = [SearchHit(score=float(p.score), payload=dict(p.payload or {})) for p in result.points]
+        return self._filter_chunks(raw, k)
 
     def list_brands(self) -> list[str]:
         """Distinct `brand` values in kb_chunks. Cheap scroll over payload."""

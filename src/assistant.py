@@ -25,6 +25,7 @@ from src.triage import (
 )
 
 CONFIDENCE_THRESHOLD = 1.0  # only error-code regex hits (conf=1.0) use KB directly; all else → chunks
+KB_FALLBACK_THRESHOLD = 0.70  # min confidence to use KB answer when chunk fallback finds nothing
 MIN_MEANINGFUL_LEN = 4
 
 
@@ -206,6 +207,35 @@ class CoffeeBotAssistant:
             )
             if chunk_response is not None:
                 return chunk_response
+            # Chunk fallback found nothing — try KB entry as last resort before generic fallback
+            if entry is not None and confidence >= KB_FALLBACK_THRESHOLD:
+                _dbg(f"[assistant] chunk miss → KB fallback (conf={confidence:.3f} entry={entry.id})")
+                conversation["last_entry_id"] = entry.id
+                if category == "clarify":
+                    text = entry.answer
+                    if user_name and not text.lower().startswith(user_name.lower()):
+                        text = f"{user_name}, {text[0].lower()}{text[1:]}"
+                    return {
+                        "response": text,
+                        "category": category,
+                        "kb_entry_id": entry.id,
+                        "confidence": confidence,
+                        "source": "kb_fallback",
+                    }
+                response = self.generator.generate(
+                    user_query=user_query,
+                    retrieved_instruction=entry.answer,
+                    category=category,
+                    user_name=user_name,
+                    user_bio=user_bio,
+                )
+                return {
+                    "response": response,
+                    "category": category,
+                    "kb_entry_id": entry.id,
+                    "confidence": confidence,
+                    "source": "kb_fallback",
+                }
             _dbg("[assistant] low confidence + no chunk hit → fallback")
             return self._fallback_response(user_name)
 

@@ -24,9 +24,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from dotenv import load_dotenv  # noqa: E402
+load_dotenv(ROOT / ".env")
+
 from src.retriever import (  # noqa: E402
     CHUNKS_COLLECTION,
     VectorRetriever,
+    _ua_ratio,
     load_default_encoder,
 )
 
@@ -182,12 +186,31 @@ def chunk_prose(pages: list[PageData]) -> list[Chunk]:
     return chunks
 
 
+_MIN_PAGE_UA_RATIO = 0.15   # skip pages with <15% Cyrillic letters (Dutch/English pages)
+_MIN_PAGE_UA_SPECIFIC = 0.01  # skip pages with <1% Ukrainian-specific chars (Russian/Macedonian)
+
+_UA_UNIQUE = frozenset("іїєґІЇЄҐ")
+
+
+def _ua_specific_ratio(text: str) -> float:
+    alpha = [c for c in text if c.isalpha()]
+    if not alpha:
+        return 0.0
+    return sum(1 for c in alpha if c in _UA_UNIQUE) / len(alpha)
+
+
 def chunk_pages(pages: list[PageData]) -> list[Chunk]:
-    """Route each page: table pages → row-per-chunk; prose pages → sentence packing."""
+    """Route each page: table pages → row-per-chunk; prose pages → sentence packing.
+    Pages with <15% Cyrillic or <1% Ukrainian-specific chars are skipped.
+    """
     table_chunks: list[Chunk] = []
     prose_pages: list[PageData] = []
 
     for p in pages:
+        if _ua_ratio(p.text) < _MIN_PAGE_UA_RATIO:
+            continue
+        if _ua_specific_ratio(p.text) < _MIN_PAGE_UA_SPECIFIC:
+            continue
         if p.tables:
             for table in p.tables:
                 table_chunks.extend(table_to_chunks(table, p.page_no))
@@ -213,7 +236,7 @@ def discover_pdfs(limit: int | None) -> list[Path]:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=None, help="ingest only first N PDFs (debug)")
-    ap.add_argument("--min-chunk-chars", type=int, default=40)
+    ap.add_argument("--min-chunk-chars", type=int, default=80)
     args = ap.parse_args()
 
     pdfs = discover_pdfs(args.limit)
