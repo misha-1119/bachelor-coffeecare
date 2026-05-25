@@ -1,0 +1,33 @@
+# Overlay for local Lapa (Ollama) mode.
+# Usage: docker compose -f docker-compose.yml -f docker-compose.lapa.yml up
+#
+# Adds ollama service and wires bot to use it instead of Groq.
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    volumes:
+      - ollama_data:/root/.ollama
+      - ./docker/ollama-entrypoint.sh:/entrypoint.sh:ro
+    ports:
+      - "11434:11434"
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/11434' 2>/dev/null || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  bot:
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      DISABLE_LLAMA: ""
+      DISABLE_GROQ: "1"
+      OLLAMA_URL: http://ollama:11434/api/generate
+
+volumes:
+  ollama_data:

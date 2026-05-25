@@ -24,7 +24,7 @@ from src.triage import (
     negative_meta_reply,
 )
 
-CONFIDENCE_THRESHOLD = 1.0  # only error-code regex hits (conf=1.0) use KB directly; all else → chunks
+CONFIDENCE_THRESHOLD = 0.90  # was 1.0; lowered so high-conf paraphrases use KB directly instead of chunk fallback
 KB_FALLBACK_THRESHOLD = 0.70  # min confidence to use KB answer when chunk fallback finds nothing
 MIN_MEANINGFUL_LEN = 4
 
