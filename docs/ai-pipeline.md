@@ -20,7 +20,7 @@ User message
   4. Apply keyword boost on top-10 (+0.15 phrase, +0.05 long-token, +0.04 stem; max +0.45)
   5. Pick best entry; legacy numpy path used only when retriever is unavailable
      │
-     ├── confidence = 1.0 (error-code regex hit) ──► [generator.py — Stage 2: Lapa LLM]
+     ├── confidence ≥ 0.90 (error-code regex = 1.0, high-conf KB = 0.90–1.0) ──► [generator.py — Stage 2: Groq / Lapa]
      │
      └── confidence < 1.0 (all other queries) ──► [assistant.py — chunk fallback cascade]
               │
@@ -56,7 +56,7 @@ The pending query is consumed exactly once and cleared regardless of the result.
 - **Encoded text** for `kb_qa`: `"{category}: {question} | {first 10 keywords}"`.
 - **Model filter** pushed into Qdrant as a `should` filter on `model == user_slug OR == "universal"`.
 - **Error code override** runs before vector search; regex `\be\s*0?(\d{1,2})\b` short-circuits to a deterministic KB entry with confidence=1.0.
-- **CONFIDENCE_THRESHOLD = 1.0**: Only error-code regex hits (conf=1.0) use `kb_qa` directly. All other queries skip to the chunk cascade regardless of `kb_qa` score.
+- **CONFIDENCE_THRESHOLD = 0.90**: Queries scoring ≥ 0.90 in `kb_qa` use the curated entry directly. Error-code regex hits fire at conf=1.0 (always above threshold). Lowered from 1.0 to allow high-confidence paraphrase matches to use `kb_direct` instead of falling to the chunk cascade.
 
 ## Chunk Fallback Cascade
 
@@ -72,14 +72,22 @@ Cascade stops at the first tier with `best.score ≥ CHUNK_THRESHOLD` (env-tunab
 
 The cascade honours `tried_chunk_ids` from the conversation state: chunks the user already saw via the "не спрацювало" flow are excluded with a Qdrant `must_not` filter on `chunk_id`.
 
-## Stage 2: Generator (Lapa LLM)
+## Stage 2: Generator (Groq → Lapa fallback)
 
+Priority order: **Groq API → Ollama/Lapa → raw KB text**.
+
+### Groq (primary)
+- **Model**: `llama-3.3-70b-versatile` via `https://api.groq.com/openai/v1/chat/completions`.
+- **Configured via**: `GROQ_API_KEY` + optional `GROQ_MODEL` env vars.
+- **Disabled by**: `DISABLE_GROQ=1`.
+- **Parameters**: temperature 0.3, max_tokens 200, top_p 0.9. Latency ~0.6–1.9 s.
+
+### Lapa (fallback)
 - **Model**: `hf.co/lapa-llm/lapa-v0.1.2-instruct-GGUF` (Gemma-3-12B, Ukrainian-tuned).
 - **Runtime**: Ollama; URL configured via `OLLAMA_URL` env var.
-  - Local: `http://localhost:11434/api/generate` (Docker Compose wires this automatically).
-  - Railway: ngrok HTTPS tunnel to local Ollama — run `./scripts/start_ollama_tunnel.sh`, paste printed URL into Railway `OLLAMA_URL`.
-- **Availability check**: `DISABLE_LLAMA=1` disables LLM (Railway default when tunnel not active). Generator falls back to raw chunk/KB text with a "розкажи детальніше" footer.
-- **Parameters**: temperature 0.3, max 160 tokens, top_p 0.9, context 1024.
+  - Local: `http://localhost:11434/api/generate` (Docker Compose wires this via `docker-compose.lapa.yml`).
+- **Disabled by**: `DISABLE_LLAMA=1` (set automatically in Groq-only mode).
+- **Parameters**: temperature 0.3, num_predict 80, top_p 0.9, context 1024.
 - **System prompt rules**:
   - Only Ukrainian, conversational tone.
   - 2–4 sentences max.
