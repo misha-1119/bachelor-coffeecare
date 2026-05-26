@@ -23,8 +23,13 @@ export default defineSchema({
     telegramUsername: v.optional(v.string()),
     name: v.optional(v.string()),
     machine: v.optional(v.string()),
+    machineAddedAt: v.optional(v.number()),
     bio: v.optional(v.string()),
     messageCount: v.number(),
     bioGeneratedAt: v.optional(v.number()),
+    diagnosticCount: v.optional(v.number()),
+    frequentCategories: v.optional(
+      v.array(v.object({ cat: v.string(), count: v.number() }))
+    ),
   }).index("by_telegram_user_id", ["telegramUserId"]),
 });

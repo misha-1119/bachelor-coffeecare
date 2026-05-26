@@ -1,13 +1,12 @@
-"""
-Telegram bot for CoffeeCare.
+"""Telegram bot for CoffeeCare — guided diagnostic flow.
 
 Commands:
-  /start  — greet and start flow
-  /model  — set machine brand/model
-  /mode   — toggle NLP <-> rule_based per user
-  /debug  — toggle per-user debug trace (/debug on|off, default from DEBUG_MODE env)
-  /reset  — clear user state
-  /eval   — dev only: run evaluation
+  /start    — onboarding + home
+  /menu     — home dashboard
+  /model    — change machine
+  /profile  — profile view
+  /reset    — clear state, restart onboarding
+  /help     — usage hint
 """
 
 import os
@@ -16,6 +15,7 @@ import logging
 import threading
 import time
 import traceback
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from telegram import (
@@ -26,6 +26,7 @@ from telegram import (
     BotCommand,
 )
 from telegram.constants import ChatAction
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -35,90 +36,35 @@ from telegram.ext import (
     filters,
 )
 
-from src.knowledge_base import KnowledgeBase
-from src.assistant import CoffeeBotAssistant, _resolve_brand
-from src.rule_based import RuleBasedAssistant
+from src.assistant import CoffeeBotAssistant
 from src.user_repository import UserRepository
-from src.bio_generator import generate_bio
-
-BIO_TRIGGER_AT = 5
-MAX_DEBUG_CHARS = 3500
+from src.diagnostic_tree import get_tree, Category, Node, Option, Leaf
+from src.brand_matcher import suggest_models, detect_brand, normalize_model_slug
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
+# In-memory per-user runtime state. Persistent fields live in Convex.
+# state shape:
+#   stage: "awaiting_name" | "awaiting_model" | "awaiting_free_text" | "ready"
+#   name: str | None
+#   machine: str | None             # slug
+#   machine_display: str | None     # human label
+#   flow: dict | None
+#       cat: str
+#       path: list[tuple[str, str]]  # (node_id, option_id_or_input)
+#       awaiting_node: str | None    # node id awaiting free-text input
 USER_STATE: dict[int, dict] = {}
-USER_MODE: dict[int, str] = {}
+
+# Per-user last AI result for "more detail" callback.
 USER_CONVERSATION: dict[int, dict] = {}
-USER_MESSAGES: dict[int, list[str]] = {}
-USER_DEBUG: dict[int, bool] = {}
 
-
-def _env_debug_default() -> bool:
-    return os.getenv("DEBUG_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _debug_enabled(user_id: int) -> bool:
-    return USER_DEBUG.get(user_id, _env_debug_default())
-
-
-async def _send_debug(send_fn, user_id: int, steps: list[str]) -> None:
-    if not _debug_enabled(user_id) or not steps:
-        return
-    body = "\n".join(steps)
-    if len(body) > MAX_DEBUG_CHARS:
-        body = body[:MAX_DEBUG_CHARS] + "\n…[truncated]"
-    await send_fn(f"🐞 debug trace:\n<pre>{_html_escape(body)}</pre>", parse_mode="HTML")
-
-
-async def _live_debug_pump(bot, chat_id: int, steps: list[str], started_at: float,
-                            tick_interval: float = 1.5, heartbeat_every: float = 4.0):
-    """Periodic pump: flushes new debug steps + keeps typing indicator alive + emits heartbeats.
-    Cancel when work done."""
-    last_idx = 0
-    last_hb = started_at
-    try:
-        await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-        while True:
-            await asyncio.sleep(tick_interval)
-            now = time.monotonic()
-            new = steps[last_idx:]
-            if new:
-                last_idx = len(steps)
-                body = "\n".join(new)
-                if len(body) > MAX_DEBUG_CHARS:
-                    body = body[:MAX_DEBUG_CHARS] + "\n…[truncated]"
-                try:
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text=f"🐞 step (+{now - started_at:.1f}s):\n<pre>{_html_escape(body)}</pre>",
-                        parse_mode="HTML",
-                    )
-                except Exception as e:
-                    log.warning("live debug push failed: %s", e)
-                last_hb = now
-            elif now - last_hb >= heartbeat_every:
-                try:
-                    await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-                    await bot.send_message(chat_id=chat_id, text=f"🐞 working… +{now - started_at:.1f}s")
-                except Exception as e:
-                    log.warning("heartbeat failed: %s", e)
-                last_hb = now
-            else:
-                try:
-                    await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-                except Exception:
-                    pass
-    except asyncio.CancelledError:
-        pass
+TG_MSG_LIMIT = 4096
 
 
 def _html_escape(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-TG_MSG_LIMIT = 4096
 
 
 def _split_for_telegram(text: str, limit: int = TG_MSG_LIMIT) -> list[str]:
@@ -150,8 +96,8 @@ async def _send_long(send_fn, text: str, **kwargs):
         else:
             await send_fn(chunk, **kwargs)
 
+
 _assistant: CoffeeBotAssistant | None = None
-_rule_based: RuleBasedAssistant | None = None
 _user_repo: UserRepository | None = None
 
 
@@ -160,15 +106,6 @@ def _get_assistant() -> CoffeeBotAssistant:
     if _assistant is None:
         _assistant = CoffeeBotAssistant()
     return _assistant
-
-
-def _get_rule_based() -> RuleBasedAssistant:
-    global _rule_based
-    if _rule_based is None:
-        # Share the KB instance the NLP assistant already loaded so we don't pay
-        # the Convex/JSON load twice on cold start.
-        _rule_based = RuleBasedAssistant(_get_assistant().kb)
-    return _rule_based
 
 
 def _get_user_repo() -> UserRepository:
@@ -181,121 +118,396 @@ def _get_user_repo() -> UserRepository:
 def _ensure_state(user_id: int) -> dict:
     state = USER_STATE.get(user_id)
     if state is None:
-        state = {"model": None, "stage": "ready"}
+        state = {
+            "stage": "ready",
+            "name": None,
+            "machine": None,
+            "machine_display": None,
+            "flow": None,
+        }
         USER_STATE[user_id] = state
     return state
 
 
-def _kb_step1() -> InlineKeyboardMarkup:
+def _reset_flow(state: dict) -> None:
+    state["flow"] = None
+    if state.get("stage") == "awaiting_free_text":
+        state["stage"] = "ready"
+
+
+# ---------- Keyboards ----------
+
+
+def kb_add_machine() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Додати кавомашину ☕", callback_data="action:add_machine")],
-        [InlineKeyboardButton("Пропустити", callback_data="action:skip_machine")],
+        [InlineKeyboardButton("☕ Додати модель", callback_data="machine:add")],
+        [InlineKeyboardButton("⏭ Пропустити", callback_data="machine:skip")],
     ])
 
 
-def _kb_step2() -> InlineKeyboardMarkup:
+def kb_model_suggestions(suggestions: list[str]) -> InlineKeyboardMarkup:
+    rows = []
+    for s in suggestions[:3]:
+        slug = normalize_model_slug(s)
+        rows.append([InlineKeyboardButton(s, callback_data=f"machine:confirm:{slug}")])
+    rows.append([InlineKeyboardButton("Інша модель", callback_data="machine:retry")])
+    rows.append([InlineKeyboardButton("⏭ Пропустити", callback_data="machine:skip")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_unknown_brand() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Спробувати ще", callback_data="machine:retry")],
+        [InlineKeyboardButton("Загальні поради", callback_data="machine:skip")],
+    ])
+
+
+def kb_home() -> InlineKeyboardMarkup:
+    tree = get_tree()
+    buttons = tree.category_buttons()
+    rows: list[list[InlineKeyboardButton]] = []
+    pair: list[InlineKeyboardButton] = []
+    for key, label in buttons:
+        pair.append(InlineKeyboardButton(label, callback_data=f"diag:{key}"))
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+    rows.append([InlineKeyboardButton("👤 Профіль", callback_data="profile:view")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_node_options(cat: Category, node_id: str, node: Node) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    pair: list[InlineKeyboardButton] = []
+    for opt in node.options:
+        pair.append(InlineKeyboardButton(opt.label, callback_data=f"flow:{node_id}:{opt.id}"))
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+    rows.append([
+        InlineKeyboardButton("↩️ Назад", callback_data="nav:back"),
+        InlineKeyboardButton("🏠 Меню", callback_data="nav:home"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_free_text_node() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("Помилка на дисплеї", callback_data="category:error_code"),
-            InlineKeyboardButton("Проблема з кавою", callback_data="category:brewing"),
-        ],
-        [InlineKeyboardButton("Обслуговування / чистка", callback_data="category:cleaning")],
-        [InlineKeyboardButton("Інше", callback_data="category:general")],
-    ])
-
-
-def _kb_post_answer() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("Детальніше", callback_data="action:more_detail"),
-            InlineKeyboardButton("Інша проблема", callback_data="action:other_problem"),
-        ],
-        [
-            InlineKeyboardButton("Почати знову", callback_data="action:restart"),
-            InlineKeyboardButton("Мій профіль", callback_data="action:my_profile"),
-        ],
-        [InlineKeyboardButton("Головне меню", callback_data="action:menu")],
-    ])
-
-
-def _kb_skip_model() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Пропустити", callback_data="action:skip_machine")],
-    ])
-
-
-def _kb_unknown_brand() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Загальні поради", callback_data="action:skip_machine"),
-         InlineKeyboardButton("Ввести іншу", callback_data="action:retry_model")],
-    ])
-
-
-def _kb_back_to_categories() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("↩️ Назад до категорій", callback_data="action:back_to_categories")],
-    ])
-
-
-def _kb_profile() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("☕ Змінити кавомашину", callback_data="action:change_machine")],
-        [
-            InlineKeyboardButton("Інша проблема", callback_data="action:other_problem"),
-            InlineKeyboardButton("Головне меню", callback_data="action:menu"),
+            InlineKeyboardButton("↩️ Назад", callback_data="nav:back"),
+            InlineKeyboardButton("🏠 Меню", callback_data="nav:home"),
         ],
     ])
 
 
-async def _send_welcome(send_fn, user_id: int, username: str | None):
+def kb_post_answer() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📖 Дізнатись детальніше", callback_data="ai:more")],
+        [InlineKeyboardButton("✅ Проблема вирішена", callback_data="ai:done")],
+        [InlineKeyboardButton("↩️ Назад", callback_data="nav:home")],
+    ])
+
+
+def kb_profile() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("☕ Змінити модель", callback_data="machine:change")],
+        [InlineKeyboardButton("🗑 Видалити профіль", callback_data="profile:delete")],
+        [InlineKeyboardButton("🏠 Головне меню", callback_data="nav:home")],
+    ])
+
+
+def kb_profile_delete_confirm() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚠️ Так, видалити", callback_data="profile:delete:confirm")],
+        [InlineKeyboardButton("Скасувати", callback_data="profile:view")],
+    ])
+
+
+# ---------- Rendering ----------
+
+
+def _display_machine(slug: str | None, display: str | None = None) -> str:
+    if display:
+        return display
+    if not slug or slug == "universal":
+        return "не вказано"
+    return slug.replace("_", " ").strip().title()
+
+
+def _days_since(ts_ms: int | None) -> int | None:
+    if not ts_ms:
+        return None
+    try:
+        dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+        delta = datetime.now(tz=timezone.utc) - dt
+        return max(0, delta.days)
+    except Exception:
+        return None
+
+
+async def send_welcome(send_fn, user_id: int, username: str | None) -> None:
     repo = _get_user_repo()
     await asyncio.to_thread(repo.upsert_user, user_id, username)
     row = await asyncio.to_thread(repo.get_user, user_id) or {}
-    name = row.get("name")
-    machine = row.get("machine")
-
-    state = USER_STATE.get(user_id) or {"model": None, "stage": "ready", "name": None}
-    state["model"] = machine if machine else None
-    state["name"] = name
-    state["stage"] = "ready"
-    USER_STATE[user_id] = state
+    state = _ensure_state(user_id)
+    state["name"] = row.get("name")
+    state["machine"] = row.get("machine")
+    state["machine_display"] = None  # rehydrate later via slug → display
+    state["flow"] = None
     USER_CONVERSATION.pop(user_id, None)
 
-    if not name:
+    if not state["name"]:
         state["stage"] = "awaiting_name"
         await send_fn(
-            "Привіт! Я CoffeeCare.\nЯк до вас звертатись?",
+            "👋 Привіт! Я CoffeeCare AI.\n"
+            "Допомагаю:\n"
+            "• Діагностувати поломки\n"
+            "• Пояснювати ремонт\n"
+            "• Розшифровувати помилки\n"
+            "• Знаходити інструкції\n\n"
+            "Як до вас звертатись?",
             reply_markup=ReplyKeyboardRemove(),
         )
         return
 
-    if not machine or machine == "universal":
+    if not state["machine"] or state["machine"] == "universal":
+        state["stage"] = "ready"
         await send_fn(
-            f"Привіт, {name}! Я CoffeeCare.\n"
-            "Для точнішої відповіді — вкажіть модель кавомашини:",
-            reply_markup=ReplyKeyboardRemove(),
+            f"Супер, {state['name']}\n"
+            "Давайте додамо вашу кавомашину — тоді я зможу давати точніші відповіді.",
+            reply_markup=kb_add_machine(),
         )
-        await send_fn(
-            "Оберіть, як продовжити:",
-            reply_markup=_kb_step1(),
-        )
+        return
+
+    await send_home(send_fn, state)
+
+
+async def send_home(send_fn, state: dict) -> None:
+    state["stage"] = "ready"
+    state["flow"] = None
+    machine_label = _display_machine(state.get("machine"), state.get("machine_display"))
+    if state.get("machine") and state["machine"] != "universal":
+        header = f"☕ Машина підключена:\n{machine_label}\n\nЩо сталося?"
     else:
-        await send_fn(
-            f"Привіт, {name}! Я CoffeeCare.\n"
-            f"Ваша кавомашина: {_display_machine(machine)}.\nЩо сталось?",
-            reply_markup=ReplyKeyboardRemove(),
+        header = "Машина не вказана.\nЩо сталося?"
+    await send_fn(header, reply_markup=kb_home())
+
+
+async def render_node(send_fn, state: dict, cat_key: str, node_id: str) -> None:
+    tree = get_tree()
+    cat = tree.category(cat_key)
+    node = cat.node(node_id)
+    if node.options:
+        state["stage"] = "ready"
+        state["flow"]["awaiting_node"] = None
+        await send_fn(node.prompt, reply_markup=kb_node_options(cat, node_id, node))
+        return
+    if node.input == "free_text":
+        state["stage"] = "awaiting_free_text"
+        state["flow"]["awaiting_node"] = node_id
+        await send_fn(node.prompt, reply_markup=kb_free_text_node())
+        return
+    # node with neither options nor input — treat as terminal informational
+    await send_fn(node.prompt, reply_markup=kb_post_answer())
+
+
+def _confidence_label(score: float) -> str:
+    pct = int(round(score * 100))
+    if score >= 0.75:
+        tier = "Висока"
+    elif score >= 0.5:
+        tier = "Середня"
+    else:
+        tier = "Низька"
+    return f"{tier} ({pct}%)"
+
+
+async def run_ai(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int,
+                 state: dict, leaf: Leaf, summary_text: str) -> None:
+    """Stream progress edits, run assistant, emit final response."""
+    placeholder = await ctx.bot.send_message(
+        chat_id=chat_id,
+        text="🔍 Аналізую симптоми…",
+    )
+
+    async def edit(text: str) -> None:
+        try:
+            await ctx.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=placeholder.message_id,
+                text=text,
+            )
+        except BadRequest:
+            pass
+
+    progress_done = asyncio.Event()
+
+    async def progress_loop() -> None:
+        steps = [
+            (1.2, "🔧 Перевіряю типові проблеми…"),
+            (1.2, "📚 Шукаю в інструкціях…"),
+            (1.5, "✍️ Формую рішення…"),
+        ]
+        for delay, msg in steps:
+            try:
+                await asyncio.wait_for(progress_done.wait(), timeout=delay)
+                return
+            except asyncio.TimeoutError:
+                await edit(msg)
+
+    pump = asyncio.create_task(progress_loop())
+
+    assistant = _get_assistant()
+    machine = state.get("machine") or "universal"
+    name = state.get("name")
+    conversation = USER_CONVERSATION.setdefault(user_id, {})
+    try:
+        result = await asyncio.to_thread(
+            assistant.respond,
+            summary_text,
+            name,
+            machine,
+            conversation,
+            None,  # user_bio dropped
+            None,  # debug_log dropped
         )
-        await send_fn(
-            "Оберіть категорію проблеми:",
-            reply_markup=_kb_step2(),
-        )
+    except Exception as e:
+        log.exception("respond() failed for user %s: %s", user_id, e)
+        result = {
+            "response": "Не вдалося обробити запит. Спробуйте /menu.",
+            "source": "error",
+            "category": None,
+            "confidence": 0.0,
+            "kb_entry_id": None,
+        }
+    finally:
+        progress_done.set()
+        try:
+            await pump
+        except Exception:
+            pass
+
+    confidence_score = float(result.get("confidence") or 0.0)
+    body = result["response"]
+    final = (
+        f"{body}\n\n"
+        f"🎯 <b>Впевненість AI:</b> {_confidence_label(confidence_score)}\n"
+        f"🔧 <b>Складність ремонту:</b> {leaf.complexity}"
+    )
+
+    # Replace placeholder with the final answer (or send fresh if too long).
+    chunks = _split_for_telegram(final)
+    if len(chunks) == 1:
+        try:
+            await ctx.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=placeholder.message_id,
+                text=chunks[0],
+                parse_mode="HTML",
+                reply_markup=kb_post_answer(),
+            )
+        except BadRequest:
+            await ctx.bot.send_message(
+                chat_id=chat_id,
+                text=chunks[0],
+                parse_mode="HTML",
+                reply_markup=kb_post_answer(),
+            )
+    else:
+        try:
+            await ctx.bot.delete_message(chat_id=chat_id, message_id=placeholder.message_id)
+        except BadRequest:
+            pass
+        for idx, chunk in enumerate(chunks):
+            kwargs = {"chat_id": chat_id, "text": chunk, "parse_mode": "HTML"}
+            if idx == len(chunks) - 1:
+                kwargs["reply_markup"] = kb_post_answer()
+            await ctx.bot.send_message(**kwargs)
+
+    # Remember context for "more detail" / "done" callbacks.
+    conversation["last_complexity"] = leaf.complexity
+    conversation["last_category"] = state.get("flow", {}).get("cat") if state.get("flow") else None
+    state["stage"] = "ready"
+
+
+async def show_profile(send_fn, user_id: int, username: str | None) -> None:
+    repo = _get_user_repo()
+    await asyncio.to_thread(repo.upsert_user, user_id, username)
+    row = await asyncio.to_thread(repo.get_user, user_id) or {}
+    state = _ensure_state(user_id)
+
+    name = row.get("name") or state.get("name") or "не вказано"
+    machine_slug = row.get("machine") or state.get("machine")
+    machine = _display_machine(machine_slug)
+    days = _days_since(row.get("machineAddedAt"))
+    diag_count = row.get("diagnosticCount") or 0
+    top_cats = _get_user_repo().top_categories(row, n=2)
+
+    tree = get_tree()
+    cat_label = {k: lbl for k, lbl in tree.category_buttons()}
+
+    lines = [
+        f"👤 <b>{_html_escape(name)}</b>",
+        "",
+        f"☕ {_html_escape(machine)}",
+    ]
+    if days is not None and machine_slug and machine_slug != "universal":
+        lines.append(f"📅 Додано: {days} {'день' if days == 1 else 'днів'} тому")
+    lines.append(f"🔧 Діагностик: {diag_count}")
+
+    if top_cats:
+        lines.append("")
+        lines.append("⚠️ Часті проблеми:")
+        for cat_key, count in top_cats:
+            label = cat_label.get(cat_key, cat_key)
+            lines.append(f"  • {label} — {count}")
+
+    await send_fn("\n".join(lines), parse_mode="HTML", reply_markup=kb_profile())
+
+
+# ---------- Commands ----------
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    await _send_welcome(
+    USER_STATE.pop(user_id, None)
+    USER_CONVERSATION.pop(user_id, None)
+    await send_welcome(
         update.message.reply_text,
         user_id,
+        update.effective_user.username,
+    )
+
+
+async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    state = _ensure_state(user_id)
+    if not state.get("name") or not state.get("machine"):
+        await send_welcome(update.message.reply_text, user_id, update.effective_user.username)
+        return
+    await send_home(update.message.reply_text, state)
+
+
+async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    state = _ensure_state(user_id)
+    state["stage"] = "awaiting_model"
+    state["flow"] = None
+    await update.message.reply_text(
+        "Напишіть бренд і модель кавомашини.\n"
+        "Напр.: Philips EP5447, DeLonghi Magnifica S, Jura E8.",
+        reply_markup=kb_unknown_brand(),
+    )
+
+
+async def cmd_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await show_profile(
+        update.message.reply_text,
+        update.effective_user.id,
         update.effective_user.username,
     )
 
@@ -303,470 +515,238 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     USER_STATE.pop(user_id, None)
-    USER_MODE.pop(user_id, None)
     USER_CONVERSATION.pop(user_id, None)
-    USER_MESSAGES.pop(user_id, None)
     await cmd_start(update, ctx)
-
-
-async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    state = _ensure_state(user_id)
-    state["stage"] = "awaiting_model"
-    await update.message.reply_text(
-        "Напишіть бренд і модель вашої кавомашини. Напр.:\n"
-        "  • DeLonghi Magnifica S\n"
-        "  • Philips 3200 LatteGo\n"
-        "  • Jura E8\n\n"
-        "Або «не знаю» — відповідатиму загальними інструкціями.",
-        reply_markup=_kb_skip_model(),
-    )
-
-
-async def cmd_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    cur = USER_MODE.get(user_id, "nlp")
-    new = "rule_based" if cur == "nlp" else "nlp"
-    USER_MODE[user_id] = new
-    await update.message.reply_text(f"Режим змінено на: {new}")
-
-
-async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    arg = (ctx.args[0].lower() if ctx.args else "").strip()
-    if arg in {"on", "1", "true", "yes"}:
-        USER_DEBUG[user_id] = True
-    elif arg in {"off", "0", "false", "no"}:
-        USER_DEBUG[user_id] = False
-    else:
-        USER_DEBUG[user_id] = not _debug_enabled(user_id)
-    state = "ON" if _debug_enabled(user_id) else "OFF"
-    await update.message.reply_text(
-        f"Debug mode: {state}\n(env default: DEBUG_MODE={os.getenv('DEBUG_MODE', '0')})"
-    )
-
-
-def _display_machine(value: str | None) -> str:
-    if not value or value == "universal":
-        return "не вказано"
-    return value.replace("_", " ").strip().title()
-
-
-def _format_profile(user_row: dict | None, state: dict) -> str:
-    if not user_row:
-        return "Профіль ще не створено. Надішліть кілька повідомлень — я запам'ятаю ваші вподобання."
-    name = state.get("name") or user_row.get("name") or "не вказано"
-    machine = _display_machine(state.get("model") or user_row.get("machine"))
-    count = user_row.get("messageCount", 0)
-    bio = user_row.get("bio")
-    username = user_row.get("telegramUsername")
-
-    lines = ["Ваш профіль\n"]
-    lines.append(f"Ім'я: {name}")
-    if username:
-        lines.append(f"Telegram: @{username}")
-    lines.append(f"Кавомашина: {machine}")
-    lines.append(f"Повідомлень: {count}")
-    if bio:
-        lines.append(f"\nПро вас:\n{bio}")
-    else:
-        remaining = max(0, BIO_TRIGGER_AT - count)
-        if remaining > 0:
-            lines.append(f"\nПрофіль сформується після ще {remaining} повідомлень.")
-    return "\n".join(lines)
-
-
-async def _show_profile(send_fn, user_id: int, username: str | None):
-    repo = _get_user_repo()
-    await asyncio.to_thread(repo.upsert_user, user_id, username)
-    user_row = await asyncio.to_thread(repo.get_user, user_id)
-    state = _ensure_state(user_id)
-    text = _format_profile(user_row, state)
-    await send_fn(text, reply_markup=_kb_profile())
-
-
-async def cmd_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    await _show_profile(update.message.reply_text, user_id, update.effective_user.username)
-
-
-async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await _send_welcome(
-        update.message.reply_text,
-        update.effective_user.id,
-        update.effective_user.username,
-    )
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (
-        "<b>CoffeeCare — бот-консультант з кавомашин</b>\n\n"
+        "<b>CoffeeCare AI</b>\n\n"
         "Команди:\n"
-        "/start — почати з початку\n"
+        "/start — почати знову\n"
         "/menu — головне меню\n"
         "/model — змінити кавомашину\n"
         "/profile — мій профіль\n"
-        "/mode — перемкнути режим (NLP / правила)\n"
         "/reset — очистити стан\n"
         "/help — ця довідка\n\n"
-        "Напишіть проблему звичайним текстом — підкажу рішення."
+        "Користуйтесь кнопками — оберіть категорію проблеми і уточнюйте крок за кроком."
     )
     await update.message.reply_text(text, parse_mode="HTML")
 
 
-async def cmd_eval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Запускаю оцінювання, зачекайте...")
-    from evaluation.evaluate import run_full_evaluation
-
-    res = run_full_evaluation()
-    nlp = res["nlp"]
-    rb = res["rule_based"]
-    text = (
-        "<b>Результати оцінювання</b>\n\n"
-        f"<b>NLP (liberta-large)</b>\n"
-        f"P: {nlp['precision']:.3f}  R: {nlp['recall']:.3f}  "
-        f"F1: {nlp['f1']:.3f}  Top-1: {nlp['top1_accuracy']:.3f}  "
-        f"Lat: {nlp['avg_latency_s']:.3f}с\n\n"
-        f"<b>Rule-based</b>\n"
-        f"P: {rb['precision']:.3f}  R: {rb['recall']:.3f}  "
-        f"F1: {rb['f1']:.3f}  Top-1: {rb['top1_accuracy']:.3f}  "
-        f"Lat: {rb['avg_latency_s']:.3f}с"
-    )
-    await update.message.reply_text(text, parse_mode="HTML")
+# ---------- Callback routing ----------
 
 
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-    data = query.data
+    data = query.data or ""
     state = _ensure_state(user_id)
+    chat_id = query.message.chat_id if query.message else user_id
 
-    if data == "action:add_machine":
-        state["stage"] = "awaiting_model"
-        await query.edit_message_text(
-            "Напишіть бренд і модель вашої кавомашини. Напр.:\n"
-            "  • DeLonghi Magnifica S\n"
-            "  • Philips 3200 LatteGo\n"
-            "  • Jura E8\n\n"
-            "Або «не знаю» — відповідатиму загальними інструкціями.",
-            reply_markup=_kb_skip_model(),
-        )
+    parts = data.split(":")
+    ns = parts[0] if parts else ""
 
-    elif data == "action:change_machine":
-        state["stage"] = "awaiting_model"
-        state["model"] = None
-        state["hint_category"] = None
-        USER_CONVERSATION.pop(user_id, None)
-        await query.message.reply_text(
-            "Напишіть нову модель кавомашини. Напр.:\n"
-            "  • DeLonghi Magnifica S\n"
-            "  • Philips 3200 LatteGo\n"
-            "  • Jura E8\n\n"
-            "Або «не знаю» — відповідатиму загальними інструкціями.",
-            reply_markup=_kb_skip_model(),
-        )
+    if ns == "machine":
+        await _handle_machine(query, state, parts[1:], user_id)
+        return
 
-    elif data == "action:skip_machine":
-        state["model"] = "universal"
-        state["stage"] = "ready"
-        _get_user_repo().set_machine(user_id, "universal")
-        await query.edit_message_text(
-            "Добре, відповідатиму загальними інструкціями.\nЩо сталось?",
-            reply_markup=_kb_step2(),
-        )
+    if ns == "diag":
+        if len(parts) < 2:
+            return
+        cat_key = parts[1]
+        try:
+            cat = get_tree().category(cat_key)
+        except KeyError:
+            await query.message.reply_text("Невідома категорія. /menu")
+            return
+        state["flow"] = {"cat": cat_key, "path": [], "awaiting_node": None}
+        await render_node(query.message.reply_text, state, cat_key, cat.root)
+        return
 
-    elif data == "action:retry_model":
-        state["stage"] = "awaiting_model"
-        await query.edit_message_text(
-            "Введіть марку та модель кавомашини (наприклад, Philips EP2231, DeLonghi Magnifica):",
-            reply_markup=_kb_skip_model(),
-        )
+    if ns == "flow":
+        if len(parts) < 3 or not state.get("flow"):
+            await query.message.reply_text("Сесія діагностики скинута. /menu")
+            return
+        node_id, opt_id = parts[1], parts[2]
+        cat_key = state["flow"]["cat"]
+        try:
+            opt = get_tree().resolve_option(cat_key, node_id, opt_id)
+        except KeyError:
+            await query.message.reply_text("Невідомий варіант. /menu")
+            return
+        state["flow"]["path"].append((node_id, opt_id))
+        if opt.leaf:
+            summary = get_tree().collect_summary(cat_key, state["flow"]["path"])
+            await run_ai(ctx, chat_id, user_id, state, opt.leaf, summary)
+            return
+        if opt.next:
+            await render_node(query.message.reply_text, state, cat_key, opt.next)
+            return
+        await query.message.reply_text("Гілка закінчилась без leaf. /menu")
+        return
 
-    elif data.startswith("category:"):
-        category = data.split(":", 1)[1]
-        state["hint_category"] = category
-        state["stage"] = "ready"
-        hints = {
-            "error_code": "Напишіть код помилки або опишіть що показує дисплей.",
-            "brewing": "Опишіть проблему з кавою — смак, об'єм, температура?",
-            "cleaning": "Що саме потрібно: декальцинація, чистка блоку, молочна система?",
-            "general": "Опишіть проблему — постараюся допомогти.",
-        }
-        await query.edit_message_text(
-            hints.get(category, "Опишіть проблему."),
-            reply_markup=_kb_back_to_categories(),
-        )
-
-    elif data == "action:back_to_categories":
-        state["hint_category"] = None
-        state["stage"] = "ready"
-        await query.edit_message_text(
-            "Оберіть категорію проблеми:",
-            reply_markup=_kb_step2(),
-        )
-
-    elif data == "action:more_detail":
-        conversation = USER_CONVERSATION.setdefault(user_id, {})
-        last_id = conversation.get("last_entry_id")
-        if last_id:
-            kb = _get_assistant().kb
-            entry = next((e for e in kb.entries if e.id == last_id), None)
-            if entry:
-                await _send_long(query.message.reply_text, entry.answer, reply_markup=_kb_post_answer())
+    if ns == "nav":
+        action = parts[1] if len(parts) > 1 else ""
+        if action == "home":
+            _reset_flow(state)
+            await send_home(query.message.reply_text, state)
+            return
+        if action == "back":
+            flow = state.get("flow")
+            if not flow or not flow.get("path"):
+                _reset_flow(state)
+                await send_home(query.message.reply_text, state)
                 return
-        last_chunk = conversation.get("last_chunk")
-        if last_chunk and last_chunk.get("text"):
-            text = last_chunk["text"]
-            file = last_chunk.get("file", "")
-            page = last_chunk.get("page_start")
-            citation = f"\n\n_Джерело: {file}"
-            if page:
-                citation += f", стор. {page}"
-            citation += "._"
-            await _send_long(query.message.reply_text, text + citation, reply_markup=_kb_post_answer())
+            flow["path"].pop()
+            if not flow["path"]:
+                cat = get_tree().category(flow["cat"])
+                await render_node(query.message.reply_text, state, flow["cat"], cat.root)
+            else:
+                prev_node_id, prev_opt_id = flow["path"][-1]
+                prev_opt = get_tree().resolve_option(flow["cat"], prev_node_id, prev_opt_id)
+                if prev_opt.next:
+                    await render_node(query.message.reply_text, state, flow["cat"], prev_opt.next)
+                else:
+                    # previous was a leaf — drop it and re-render parent
+                    flow["path"].pop()
+                    if flow["path"]:
+                        prev_node_id, _ = flow["path"][-1]
+                        await render_node(query.message.reply_text, state, flow["cat"], prev_node_id)
+                    else:
+                        cat = get_tree().category(flow["cat"])
+                        await render_node(query.message.reply_text, state, flow["cat"], cat.root)
             return
-        await query.message.reply_text(
-            "Поки немає деталей до попередньої відповіді. Опишіть проблему детальніше — спробую знайти точніше рішення.",
-            reply_markup=_kb_post_answer(),
-        )
 
-    elif data == "action:other_problem":
-        USER_CONVERSATION.pop(user_id, None)
-        state["hint_category"] = None
-        await query.message.reply_text("Добре. Що ще сталося?", reply_markup=_kb_step2())
-
-    elif data == "action:my_profile":
-        await _show_profile(
-            lambda text, **kw: query.message.reply_text(text, **kw),
-            user_id,
-            query.from_user.username,
-        )
-        return
-
-    elif data == "action:menu":
-        USER_CONVERSATION.pop(user_id, None)
-        await _send_welcome(
-            query.message.reply_text,
-            user_id,
-            query.from_user.username,
-        )
-
-    elif data == "action:restart":
-        USER_CONVERSATION.pop(user_id, None)
-        await _send_welcome(
-            query.message.reply_text,
-            user_id,
-            query.from_user.username,
-        )
-
-    else:
-        await query.message.reply_text(
-            "Не зрозумів кнопку. Спробуйте /menu.",
-            reply_markup=_kb_post_answer(),
-        )
-
-
-async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    text = update.message.text or ""
-
-    state = _ensure_state(user_id)
-    repo = _get_user_repo()
-    await asyncio.to_thread(repo.upsert_user, user_id, update.effective_user.username)
-
-    debug_on = _debug_enabled(user_id)
-    debug_steps: list[str] = []
-    if debug_on:
-        debug_steps.append(f"[on_message] user={user_id} text={text!r}")
-        debug_steps.append(f"[state] stage={state.get('stage')} model={state.get('model')!r} name={state.get('name')!r}")
-
-    if state.get("stage") == "awaiting_name":
-        if debug_on:
-            debug_steps.append("[flow] awaiting_name branch")
-        name = _normalize_name(text)
-        if not name:
-            await update.message.reply_text(
-                "Напишіть, будь ласка, ім'я (1–30 символів)."
-            )
-            await _send_debug(update.message.reply_text, user_id, debug_steps + ["[flow] empty name → reprompt"])
-            return
-        state["name"] = name
-        state["stage"] = "ready"
-        await asyncio.to_thread(repo.set_name, user_id, name)
-        if debug_on:
-            debug_steps.append(f"[repo] set_name={name!r}")
-        machine = state.get("model")
-        if not machine or machine == "universal":
-            await update.message.reply_text(
-                f"Приємно познайомитись, {name}!\n"
-                "Додайте кавомашину для точніших відповідей:"
-            )
-            await update.message.reply_text(
-                "Оберіть, як продовжити:",
-                reply_markup=_kb_step1(),
-            )
-        else:
-            await update.message.reply_text(
-                f"Приємно познайомитись, {name}!\n"
-                f"Ваша кавомашина: {_display_machine(machine)}.\nЩо сталось?"
-            )
-            await update.message.reply_text(
-                "Оберіть категорію проблеми:",
-                reply_markup=_kb_step2(),
-            )
-        await _send_debug(update.message.reply_text, user_id, debug_steps)
-        return
-
-    if state.get("stage") == "awaiting_model":
-        if debug_on:
-            debug_steps.append("[flow] awaiting_model branch")
-        if _looks_like_skip(text):
-            state["model"] = "universal"
-            state["stage"] = "ready"
-            await asyncio.to_thread(repo.set_machine, user_id, "universal")
-            if debug_on:
-                debug_steps.append("[flow] looks_like_skip → universal")
-            await update.message.reply_text(
-                "Добре, відповідатиму загальними інструкціями.\nЩо сталось?",
-                reply_markup=_kb_step2(),
-            )
-            await _send_debug(update.message.reply_text, user_id, debug_steps)
-            return
-        if _looks_like_question(text):
-            state["model"] = state.get("model") or "universal"
-            state["stage"] = "ready"
-            await asyncio.to_thread(repo.set_machine, user_id, state["model"])
-            if debug_on:
-                debug_steps.append(f"[flow] looks_like_question → model={state['model']!r}, fall through to respond")
-        else:
-            normalized_model = _normalize_model_input(text)
-            assistant = _get_assistant()
-            if (
-                normalized_model != "universal"
-                and assistant.known_brands
-                and _resolve_brand(normalized_model, assistant.known_brands) is None
-            ):
-                if debug_on:
-                    debug_steps.append(f"[flow] unknown brand slug={normalized_model!r} known={assistant.known_brands}")
-                display = _display_machine(normalized_model)
-                await update.message.reply_text(
-                    f"Не знайшов інструкцій для «{display}». "
-                    "Можу відповідати загальними порадами, або введіть іншу модель "
-                    "(наприклад, Philips EP2231, DeLonghi Magnifica).",
-                    reply_markup=_kb_unknown_brand(),
+    if ns == "ai":
+        action = parts[1] if len(parts) > 1 else ""
+        if action == "more":
+            conversation = USER_CONVERSATION.get(user_id, {})
+            last_chunk = conversation.get("last_chunk")
+            if last_chunk and last_chunk.get("text"):
+                text = last_chunk["text"]
+                file = last_chunk.get("file", "")
+                page = last_chunk.get("page_start")
+                cite = f"\n\n<i>Джерело: {_html_escape(file)}"
+                if page:
+                    cite += f", стор. {page}"
+                cite += ".</i>"
+                await _send_long(
+                    query.message.reply_text,
+                    text + cite,
+                    parse_mode="HTML",
+                    reply_markup=kb_post_answer(),
                 )
-                await _send_debug(update.message.reply_text, user_id, debug_steps)
                 return
-            state["model"] = normalized_model
-            state["stage"] = "ready"
-            await asyncio.to_thread(repo.set_machine, user_id, normalized_model)
-            if debug_on:
-                debug_steps.append(f"[repo] set_machine={normalized_model!r}")
-            label = _display_machine(normalized_model) if normalized_model != "universal" else None
-            reply = (
-                f"Записав: {label}.\n\nТепер — що сталося?" if label
-                else "Добре. Що сталося з машиною?"
+            last_id = conversation.get("last_entry_id")
+            if last_id:
+                kb = _get_assistant().kb
+                entry = next((e for e in kb.entries if e.id == last_id), None)
+                if entry:
+                    await _send_long(
+                        query.message.reply_text,
+                        entry.answer,
+                        reply_markup=kb_post_answer(),
+                    )
+                    return
+            await query.message.reply_text(
+                "Поки немає додаткових деталей. Опишіть проблему конкретніше через /menu.",
+                reply_markup=kb_post_answer(),
             )
-            await update.message.reply_text(reply, reply_markup=_kb_step2())
-            await _send_debug(update.message.reply_text, user_id, debug_steps)
+            return
+        if action == "done":
+            conversation = USER_CONVERSATION.get(user_id, {})
+            cat_key = conversation.get("last_category")
+            if cat_key:
+                await asyncio.to_thread(_get_user_repo().increment_diagnostic, user_id, cat_key)
+            USER_CONVERSATION.pop(user_id, None)
+            _reset_flow(state)
+            await query.message.reply_text("✅ Радий допомогти! Якщо потрібно ще — /menu")
             return
 
-    model = state.get("model") or "universal"
-    mode = USER_MODE.get(user_id, "nlp")
-    conversation = USER_CONVERSATION.setdefault(user_id, {})
-
-    buf = USER_MESSAGES.setdefault(user_id, [])
-    if len(buf) < BIO_TRIGGER_AT:
-        buf.append(text)
-    count = await asyncio.to_thread(repo.increment_message_count, user_id)
-    if debug_on:
-        debug_steps.append(f"[repo] increment_message_count → {count}")
-
-    user_row = await asyncio.to_thread(repo.get_user, user_id)
-    user_bio = user_row.get("bio") if user_row else None
-    if not state.get("name") and user_row and user_row.get("name"):
-        state["name"] = user_row["name"]
-    if not state.get("model") and user_row and user_row.get("machine"):
-        state["model"] = user_row["machine"]
-        model = state["model"]
-    if debug_on:
-        debug_steps.append(f"[merge] name={state.get('name')!r} model={model!r} bio={'yes' if user_bio else 'no'}")
-
-    if (
-        count is not None
-        and count >= BIO_TRIGGER_AT
-        and user_bio is None
-        and len(buf) >= BIO_TRIGGER_AT
-    ):
-        if debug_on:
-            debug_steps.append(f"[bio] generating (count={count} buf={len(buf)})")
-        bio = await asyncio.to_thread(lambda: generate_bio(buf, machine=model))
-        if bio:
-            await asyncio.to_thread(repo.set_bio, user_id, bio)
-            user_bio = bio
-            if debug_on:
-                debug_steps.append(f"[bio] saved len={len(bio)}")
-        elif debug_on:
-            debug_steps.append("[bio] generation returned empty")
-
-    if debug_on:
-        debug_steps.append(f"[dispatch] mode={mode}")
-
-    pump_task: asyncio.Task | None = None
-    started_at = time.monotonic()
-    if debug_on:
-        pump_task = asyncio.create_task(
-            _live_debug_pump(ctx.bot, update.effective_chat.id, debug_steps, started_at)
-        )
-
-    respond_failed = False
-    try:
-        if mode == "rule_based":
-            result = await asyncio.to_thread(_get_rule_based().respond, text)
-            if debug_on:
-                debug_steps.append(f"[rule_based] source={result.get('source')} cat={result.get('category')} conf={result.get('confidence')}")
-        else:
-            result = await asyncio.to_thread(
-                _get_assistant().respond,
-                text,
-                state.get("name"),
-                model,
-                conversation,
-                user_bio,
-                debug_steps if debug_on else None,
+    if ns == "profile":
+        action = parts[1] if len(parts) > 1 else ""
+        if action == "view":
+            await show_profile(
+                lambda text, **kw: query.message.reply_text(text, **kw),
+                user_id,
+                query.from_user.username,
             )
-    except Exception as e:
-        log.exception("respond() failed for user %s: %s", user_id, e)
-        if debug_on:
-            debug_steps.append(f"[error] {type(e).__name__}: {e}")
-        result = {
-            "response": "Не вдалося обробити запит. Спробуйте перефразувати або /reset.",
-            "source": "error",
-            "category": None,
-            "confidence": 0.0,
-            "kb_entry_id": None,
-        }
-        respond_failed = True
-    finally:
-        if pump_task is not None:
-            pump_task.cancel()
-            try:
-                await pump_task
-            except asyncio.CancelledError:
-                pass
+            return
+        if action == "delete":
+            sub = parts[2] if len(parts) > 2 else ""
+            if sub == "confirm":
+                ok = await asyncio.to_thread(_get_user_repo().delete_user, user_id)
+                USER_STATE.pop(user_id, None)
+                USER_CONVERSATION.pop(user_id, None)
+                msg = "🗑 Профіль видалено." if ok else "Профіль не знайдено."
+                await query.message.reply_text(msg + " Напишіть /start для нового початку.")
+                return
+            await query.message.reply_text(
+                "⚠️ Видалити профіль повністю? Цю дію не можна скасувати.",
+                reply_markup=kb_profile_delete_confirm(),
+            )
+            return
 
-    if debug_on:
-        debug_steps.append(f"[result] +{time.monotonic() - started_at:.2f}s source={result.get('source')} cat={result.get('category')} conf={result.get('confidence')} kb={result.get('kb_entry_id')}")
+    await query.message.reply_text("Не зрозумів дію. /menu")
 
-    await _send_long(update.message.reply_text, result["response"], reply_markup=_kb_post_answer())
-    await _send_debug(update.message.reply_text, user_id, debug_steps)
+
+async def _handle_machine(query, state: dict, args: list[str], user_id: int) -> None:
+    action = args[0] if args else ""
+
+    if action == "add":
+        state["stage"] = "awaiting_model"
+        state["flow"] = None
+        await query.message.reply_text(
+            "Напишіть бренд і модель кавомашини.\n"
+            "Напр.: Philips EP5447, DeLonghi Magnifica S, Jura E8.",
+        )
+        return
+
+    if action == "skip":
+        state["machine"] = "universal"
+        state["machine_display"] = None
+        state["stage"] = "ready"
+        await asyncio.to_thread(_get_user_repo().set_machine, user_id, "universal")
+        await send_home(query.message.reply_text, state)
+        return
+
+    if action == "retry":
+        state["stage"] = "awaiting_model"
+        state["flow"] = None
+        await query.message.reply_text(
+            "Введіть модель кавомашини ще раз. Напр.: Philips EP2231, DeLonghi Magnifica.",
+        )
+        return
+
+    if action == "change":
+        state["stage"] = "awaiting_model"
+        state["flow"] = None
+        await query.message.reply_text(
+            "Напишіть нову модель кавомашини.\n"
+            "Напр.: Philips EP5447, DeLonghi Magnifica S, Jura E8.",
+        )
+        return
+
+    if action == "confirm" and len(args) >= 2:
+        slug = args[1]
+        display = slug.replace("_", " ").title()
+        state["machine"] = slug
+        state["machine_display"] = display
+        state["stage"] = "ready"
+        await asyncio.to_thread(_get_user_repo().set_machine, user_id, slug)
+        await send_home(query.message.reply_text, state)
+        return
+
+
+# ---------- Message handler (free-text only in awaiting_* states) ----------
 
 
 _SKIP_TOKENS = {
     "не знаю", "не знаю.", "не пам'ятаю", "не пам’ятаю",
     "немає", "нема", "хз", "skip", "пропустити", "пропустити.",
-    "—", "-", "—.", "?", "??",
+    "—", "-", "?", "??",
 }
 
 
@@ -774,31 +754,95 @@ def _looks_like_skip(text: str) -> bool:
     return text.strip().lower() in _SKIP_TOKENS
 
 
-def _looks_like_question(text: str) -> bool:
-    t = text.strip().lower()
-    if "?" in t:
-        return True
-    return any(t.startswith(w) for w in ("що ", "як ", "чому ", "де ", "коли ", "чи "))
-
-
 def _normalize_name(text: str) -> str | None:
-    cleaned = text.strip()
+    cleaned = text.strip().replace("\n", " ")
     if not cleaned:
         return None
-    cleaned = cleaned.replace("\n", " ")
-    if len(cleaned) > 30:
-        cleaned = cleaned[:30].rstrip()
-    return cleaned or None
+    return cleaned[:30].rstrip() or None
 
 
-def _normalize_model_input(text: str) -> str:
-    cleaned = text.strip().lower()
-    if not cleaned or cleaned in {"не знаю", "не знаю.", "?", "хз", "skip", "пропустити"}:
-        return "universal"
-    import re
-    slug = re.sub(r"[^\w\s]", "", cleaned)
-    slug = re.sub(r"\s+", "_", slug.strip())
-    return slug[:60] or "universal"
+async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text or ""
+    state = _ensure_state(user_id)
+    repo = _get_user_repo()
+    await asyncio.to_thread(repo.upsert_user, user_id, update.effective_user.username)
+    chat_id = update.effective_chat.id
+
+    stage = state.get("stage")
+
+    if stage == "awaiting_name":
+        name = _normalize_name(text)
+        if not name:
+            await update.message.reply_text("Напишіть, будь ласка, ім'я (1–30 символів).")
+            return
+        state["name"] = name
+        state["stage"] = "ready"
+        await asyncio.to_thread(repo.set_name, user_id, name)
+        await update.message.reply_text(
+            f"Супер, {name}\n"
+            "Давайте додамо вашу кавомашину — тоді я зможу давати точніші відповіді.",
+            reply_markup=kb_add_machine(),
+        )
+        return
+
+    if stage == "awaiting_model":
+        if _looks_like_skip(text):
+            state["machine"] = "universal"
+            state["machine_display"] = None
+            state["stage"] = "ready"
+            await asyncio.to_thread(repo.set_machine, user_id, "universal")
+            await send_home(update.message.reply_text, state)
+            return
+        assistant = _get_assistant()
+        known = assistant.known_brands or None
+        suggestions = suggest_models(text, n=3, known_brands=known)
+        if not suggestions:
+            await update.message.reply_text(
+                "😕 Не вдалося визначити бренд.\nСпробуйте написати модель точніше.",
+                reply_markup=kb_unknown_brand(),
+            )
+            return
+        await update.message.reply_text(
+            "🔍 Знайшов схожі моделі:",
+            reply_markup=kb_model_suggestions(suggestions),
+        )
+        return
+
+    if stage == "awaiting_free_text":
+        flow = state.get("flow")
+        if not flow or not flow.get("awaiting_node"):
+            state["stage"] = "ready"
+            await update.message.reply_text("Сесія скинута. /menu")
+            return
+        cat_key = flow["cat"]
+        node_id = flow["awaiting_node"]
+        tree = get_tree()
+        node = tree.category(cat_key).node(node_id)
+        if not node.leaf:
+            state["stage"] = "ready"
+            await update.message.reply_text("Помилка дерева. /menu")
+            return
+        free_text = text.strip()
+        flow["path"].append((node_id, free_text))
+        flow["awaiting_node"] = None
+        summary = tree.collect_summary(cat_key, flow["path"])
+        leaf = node.leaf
+        # render summary line if template uses {input}
+        if "{input}" in leaf.summary_template:
+            extra = leaf.summary_template.format(input=free_text)
+            summary = f"{summary}\nДеталі для AI: {extra}"
+        await run_ai(ctx, chat_id, user_id, state, leaf, summary)
+        return
+
+    # Default: unexpected free text outside any awaiting state.
+    await update.message.reply_text(
+        "Користуйтесь кнопками меню — /menu",
+        reply_markup=kb_home(),
+    )
+
+
+# ---------- App lifecycle ----------
 
 
 def start_bot():
@@ -809,18 +853,15 @@ def start_bot():
     app = Application.builder().token(token).post_init(_post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("menu", cmd_menu))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("model", cmd_model))
-    app.add_handler(CommandHandler("mode", cmd_mode))
-    app.add_handler(CommandHandler("debug", cmd_debug))
-    app.add_handler(CommandHandler("eval", cmd_eval))
     app.add_handler(CommandHandler("profile", cmd_profile))
+    app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     app.add_error_handler(on_error)
 
-    log.info("Bot starting... DEBUG_MODE=%s", os.getenv("DEBUG_MODE", "0"))
+    log.info("Bot starting...")
     threading.Thread(target=_warmup, daemon=True, name="warmup").start()
     app.run_polling()
 
@@ -830,16 +871,14 @@ async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     tb = "".join(traceback.format_exception(type(err), err, err.__traceback__)) if err else ""
     log.error("Unhandled exception in handler: %s\n%s", err, tb)
     chat_id = None
-    if isinstance(update, Update):
-        if update.effective_chat:
-            chat_id = update.effective_chat.id
+    if isinstance(update, Update) and update.effective_chat:
+        chat_id = update.effective_chat.id
     if chat_id is None:
         return
     try:
         await ctx.bot.send_message(
             chat_id=chat_id,
-            text="Сталася технічна помилка. Спробуйте ще раз або /reset.",
-            reply_markup=_kb_post_answer(),
+            text="Сталася технічна помилка. Спробуйте /menu або /reset.",
         )
     except Exception as e:
         log.warning("Failed to notify user about error: %s", e)
@@ -851,7 +890,6 @@ async def _post_init(app: Application) -> None:
         BotCommand("menu", "Головне меню"),
         BotCommand("model", "Змінити кавомашину"),
         BotCommand("profile", "Мій профіль"),
-        BotCommand("mode", "Перемкнути режим"),
         BotCommand("reset", "Очистити стан"),
         BotCommand("help", "Довідка"),
     ])
@@ -860,28 +898,27 @@ async def _post_init(app: Application) -> None:
 def _warmup():
     t0 = time.monotonic()
     try:
-        log.info("[warmup] loading classifier (liberta) + assistant...")
+        log.info("[warmup] loading assistant...")
         assistant = _get_assistant()
-        log.info("[warmup] classifier ready (+%.2fs). Pinging Qdrant...", time.monotonic() - t0)
+        log.info("[warmup] assistant ready (+%.2fs)", time.monotonic() - t0)
         if assistant.retriever is not None:
             try:
+                from src.retriever import QA_COLLECTION  # noqa: F401
                 assistant.retriever.search_qa("warmup", model=None, k=1)
                 if assistant.known_brands:
                     assistant.retriever.search_chunks("warmup", model=None, k=1)
-                log.info("[warmup] Qdrant warm (+%.2fs).", time.monotonic() - t0)
+                log.info("[warmup] Qdrant warm (+%.2fs)", time.monotonic() - t0)
             except Exception as e:
                 log.warning("[warmup] Qdrant ping failed: %s", e)
-        log.info("[warmup] pinging Lapa...")
         try:
             assistant.generator.generate(
                 user_query="тест",
                 retrieved_instruction="тестова інструкція для прогріву моделі.",
                 category="warmup",
             )
-            log.info("[warmup] Lapa hot (+%.2fs total).", time.monotonic() - t0)
+            log.info("[warmup] Generator hot (+%.2fs total)", time.monotonic() - t0)
         except Exception as e:
-            log.warning("[warmup] Lapa ping failed: %s", e)
-        log.info("[warmup] complete (+%.2fs).", time.monotonic() - t0)
+            log.warning("[warmup] Generator ping failed: %s", e)
     except Exception as e:
         log.warning("[warmup] failed: %s", e)
 

@@ -94,3 +94,39 @@ class UserRepository:
             )
         except Exception as exc:
             log.warning(f"[UserRepository] setBio failed: {exc}")
+
+    def increment_diagnostic(self, telegram_user_id: int, category: str) -> int | None:
+        client = self._get_client()
+        if client is None:
+            return None
+        try:
+            return client.mutation(
+                "users:incrementDiagnostic",
+                {"telegramUserId": telegram_user_id, "category": category},
+            )
+        except Exception as exc:
+            log.warning(f"[UserRepository] incrementDiagnostic failed: {exc}")
+            return None
+
+    def delete_user(self, telegram_user_id: int) -> bool:
+        client = self._get_client()
+        if client is None:
+            return False
+        try:
+            return bool(
+                client.mutation(
+                    "users:deleteUser",
+                    {"telegramUserId": telegram_user_id},
+                )
+            )
+        except Exception as exc:
+            log.warning(f"[UserRepository] deleteUser failed: {exc}")
+            return False
+
+    def top_categories(self, user_row: dict | None, n: int = 2) -> list[tuple[str, int]]:
+        if not user_row:
+            return []
+        cats = user_row.get("frequentCategories") or []
+        items = [(c.get("cat", ""), int(c.get("count", 0))) for c in cats if c.get("cat")]
+        items.sort(key=lambda x: x[1], reverse=True)
+        return items[:n]

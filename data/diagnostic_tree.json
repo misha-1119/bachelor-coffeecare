@@ -1,0 +1,138 @@
+{
+  "version": 1,
+  "categories": {
+    "error_code": {
+      "label": "⚠️ Помилка",
+      "root": "brand",
+      "nodes": {
+        "brand": {
+          "prompt": "Введіть код помилки або виберіть бренд.",
+          "options": [
+            {"id": "philips", "label": "Philips", "next": "code_input"},
+            {"id": "delonghi", "label": "Delonghi", "next": "code_input"},
+            {"id": "jura", "label": "Jura", "next": "code_input"},
+            {"id": "saeco", "label": "Saeco", "next": "code_input"},
+            {"id": "krups", "label": "Krups", "next": "code_input"},
+            {"id": "siemens", "label": "Siemens", "next": "code_input"}
+          ]
+        },
+        "code_input": {
+          "prompt": "Введіть код помилки на дисплеї.\nНаприклад: E05\n\nАбо опишіть, що сталось.",
+          "input": "free_text",
+          "leaf": {"complexity": "Середня", "summary_template": "Код помилки/опис: {input}"}
+        }
+      }
+    },
+    "coffee": {
+      "label": "☕ Проблема з кавою",
+      "root": "what",
+      "nodes": {
+        "what": {
+          "prompt": "Що саме не так з кавою?",
+          "options": [
+            {"id": "weak", "label": "Слабка/водяниста", "next": "when"},
+            {"id": "bitter", "label": "Гірка/пересмажена", "next": "when"},
+            {"id": "sour", "label": "Кисла", "next": "when"},
+            {"id": "cold", "label": "Холодна", "leaf": {"complexity": "Середня", "summary_template": "Кава холодна — підозра на проблеми з нагрівачем/термоблоком"}},
+            {"id": "no_crema", "label": "Без пінки (crema)", "next": "when"},
+            {"id": "slow", "label": "Дуже повільно ллється", "next": "when"},
+            {"id": "no_flow", "label": "Не ллється взагалі", "leaf": {"complexity": "Висока", "summary_template": "Кава не ллється — можливе засмічення заварника або помпи"}}
+          ]
+        },
+        "when": {
+          "prompt": "Коли проблема почалась?",
+          "options": [
+            {"id": "always", "label": "Завжди так було", "leaf": {"complexity": "Низька", "summary_template": "Проблема постійна з початку — ймовірно налаштування помелу/міцності"}},
+            {"id": "recent", "label": "Нещодавно", "leaf": {"complexity": "Середня", "summary_template": "Проблема з'явилась нещодавно — ймовірно потрібна чистка або заміна зерен"}},
+            {"id": "after_clean", "label": "Після чистки/декальцинації", "leaf": {"complexity": "Низька", "summary_template": "Після обслуговування — потрібно промити систему ще раз"}}
+          ]
+        }
+      }
+    },
+    "leak": {
+      "label": "💧 Вода / протікання",
+      "root": "where",
+      "nodes": {
+        "where": {
+          "prompt": "Звідки саме тече вода?",
+          "options": [
+            {"id": "bottom", "label": "Знизу", "next": "when"},
+            {"id": "front", "label": "Спереду", "next": "when"},
+            {"id": "tank", "label": "Біля бака", "next": "when"},
+            {"id": "milk", "label": "Біля капучинатора", "next": "when"},
+            {"id": "inside", "label": "Всередині", "next": "when"},
+            {"id": "unknown", "label": "Не знаю", "next": "when"}
+          ]
+        },
+        "when": {
+          "prompt": "Коли це відбувається?",
+          "options": [
+            {"id": "startup", "label": "Під час увімкнення", "leaf": {"complexity": "Середня", "summary_template": "Протікання при ввімкненні — підозра на ущільнювачі/клапани"}},
+            {"id": "brewing", "label": "Під час приготування", "leaf": {"complexity": "Середня", "summary_template": "Протікання при приготуванні — зношений ущільнювач заварника або дренажна система"}},
+            {"id": "always", "label": "Постійно", "leaf": {"complexity": "Висока", "summary_template": "Постійне протікання — тріщина в баку/корпусі або серйозний дефект ущільнювача"}},
+            {"id": "after_off", "label": "Після вимкнення", "leaf": {"complexity": "Низька", "summary_template": "Протікання після вимкнення — нормальне дренування або злив залишків"}}
+          ]
+        }
+      }
+    },
+    "cleaning": {
+      "label": "🧽 Чистка",
+      "root": "what",
+      "nodes": {
+        "what": {
+          "prompt": "Що потрібно зробити?",
+          "options": [
+            {"id": "descale", "label": "Видалення накипу", "leaf": {"complexity": "Низька", "summary_template": "Декальцинація — процедура видалення накипу"}},
+            {"id": "milk", "label": "Чистка капучинатора", "leaf": {"complexity": "Низька", "summary_template": "Чистка молочної системи/капучинатора"}},
+            {"id": "brewer", "label": "Чистка заварника", "leaf": {"complexity": "Середня", "summary_template": "Чистка заварного блоку"}},
+            {"id": "full", "label": "Повна чистка", "leaf": {"complexity": "Середня", "summary_template": "Повна процедура чистки кавомашини"}},
+            {"id": "schedule", "label": "План догляду", "leaf": {"complexity": "Низька", "summary_template": "Рекомендований графік обслуговування кавомашини"}}
+          ]
+        }
+      }
+    },
+    "milk": {
+      "label": "🥛 Молочна система",
+      "root": "problem",
+      "nodes": {
+        "problem": {
+          "prompt": "Що з молочною системою?",
+          "options": [
+            {"id": "no_foam", "label": "Немає піни", "leaf": {"complexity": "Середня", "summary_template": "Капучинатор не збиває піну"}},
+            {"id": "no_milk", "label": "Не подає молоко", "leaf": {"complexity": "Висока", "summary_template": "Молоко не подається — засмічення або проблема насоса"}},
+            {"id": "weak_foam", "label": "Піна слабка/рідка", "leaf": {"complexity": "Низька", "summary_template": "Слабка піна — налаштування або тип молока"}},
+            {"id": "leak", "label": "Тече молоко", "leaf": {"complexity": "Середня", "summary_template": "Протікання молочного контуру"}},
+            {"id": "dirty", "label": "Брудний / запах", "leaf": {"complexity": "Низька", "summary_template": "Потрібна чистка молочної системи"}}
+          ]
+        }
+      }
+    },
+    "noise": {
+      "label": "🔊 Дивний звук",
+      "root": "kind",
+      "nodes": {
+        "kind": {
+          "prompt": "Який саме звук?",
+          "options": [
+            {"id": "grind", "label": "Скрегіт при помелі", "leaf": {"complexity": "Висока", "summary_template": "Скрегіт у кавомолці — сторонній предмет або зношені жорна"}},
+            {"id": "pump", "label": "Гучна помпа", "leaf": {"complexity": "Середня", "summary_template": "Помпа працює голосніше — можливо повітря в системі"}},
+            {"id": "rattle", "label": "Деренчання/вібрація", "leaf": {"complexity": "Низька", "summary_template": "Вібрація корпусу — перевірити встановлення"}},
+            {"id": "click", "label": "Клацання", "leaf": {"complexity": "Середня", "summary_template": "Клацання — клапани або заварний блок"}},
+            {"id": "hiss", "label": "Свист/шипіння", "leaf": {"complexity": "Середня", "summary_template": "Свист/шипіння — паровий контур або витік"}}
+          ]
+        }
+      }
+    },
+    "other": {
+      "label": "❔ Інше",
+      "root": "describe",
+      "nodes": {
+        "describe": {
+          "prompt": "Опишіть проблему своїми словами.",
+          "input": "free_text",
+          "leaf": {"complexity": "Середня", "summary_template": "{input}"}
+        }
+      }
+    }
+  }
+}

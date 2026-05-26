@@ -61,15 +61,65 @@ export const setMachine = mutation({
       .query("users")
       .withIndex("by_telegram_user_id", (q) => q.eq("telegramUserId", telegramUserId))
       .unique();
+    const now = Date.now();
     if (!existing) {
       return await ctx.db.insert("users", {
         telegramUserId,
         machine,
+        machineAddedAt: now,
         messageCount: 0,
       });
     }
-    await ctx.db.patch(existing._id, { machine });
+    const patch: Record<string, unknown> = { machine };
+    if (existing.machine !== machine || !existing.machineAddedAt) {
+      patch.machineAddedAt = now;
+    }
+    await ctx.db.patch(existing._id, patch);
     return existing._id;
+  },
+});
+
+export const incrementDiagnostic = mutation({
+  args: { telegramUserId: v.number(), category: v.string() },
+  handler: async (ctx, { telegramUserId, category }) => {
+    const existing = await ctx.db
+      .query("users")
+      .withIndex("by_telegram_user_id", (q) => q.eq("telegramUserId", telegramUserId))
+      .unique();
+    if (!existing) {
+      await ctx.db.insert("users", {
+        telegramUserId,
+        messageCount: 0,
+        diagnosticCount: 1,
+        frequentCategories: [{ cat: category, count: 1 }],
+      });
+      return 1;
+    }
+    const cats = existing.frequentCategories ?? [];
+    const idx = cats.findIndex((c) => c.cat === category);
+    const next =
+      idx >= 0
+        ? cats.map((c, i) => (i === idx ? { cat: c.cat, count: c.count + 1 } : c))
+        : [...cats, { cat: category, count: 1 }];
+    const total = (existing.diagnosticCount ?? 0) + 1;
+    await ctx.db.patch(existing._id, {
+      diagnosticCount: total,
+      frequentCategories: next,
+    });
+    return total;
+  },
+});
+
+export const deleteUser = mutation({
+  args: { telegramUserId: v.number() },
+  handler: async (ctx, { telegramUserId }) => {
+    const existing = await ctx.db
+      .query("users")
+      .withIndex("by_telegram_user_id", (q) => q.eq("telegramUserId", telegramUserId))
+      .unique();
+    if (!existing) return false;
+    await ctx.db.delete(existing._id);
+    return true;
   },
 });
 
