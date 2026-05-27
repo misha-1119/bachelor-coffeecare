@@ -140,8 +140,8 @@ def _reset_flow(state: dict) -> None:
 
 def kb_add_machine() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("☕ Додати модель", callback_data="machine:add")],
-        [InlineKeyboardButton("⏭ Пропустити", callback_data="machine:skip")],
+        [InlineKeyboardButton("Додати модель", callback_data="machine:add")],
+        [InlineKeyboardButton("Пропустити", callback_data="machine:skip")],
     ])
 
 
@@ -151,7 +151,7 @@ def kb_model_suggestions(suggestions: list[str]) -> InlineKeyboardMarkup:
         slug = normalize_model_slug(s)
         rows.append([InlineKeyboardButton(s, callback_data=f"machine:confirm:{slug}")])
     rows.append([InlineKeyboardButton("Інша модель", callback_data="machine:retry")])
-    rows.append([InlineKeyboardButton("⏭ Пропустити", callback_data="machine:skip")])
+    rows.append([InlineKeyboardButton("Пропустити", callback_data="machine:skip")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -174,7 +174,7 @@ def kb_home() -> InlineKeyboardMarkup:
             pair = []
     if pair:
         rows.append(pair)
-    rows.append([InlineKeyboardButton("👤 Профіль", callback_data="profile:view")])
+    rows.append([InlineKeyboardButton("Профіль", callback_data="profile:view")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -189,8 +189,8 @@ def kb_node_options(cat: Category, node_id: str, node: Node) -> InlineKeyboardMa
     if pair:
         rows.append(pair)
     rows.append([
-        InlineKeyboardButton("↩️ Назад", callback_data="nav:back"),
-        InlineKeyboardButton("🏠 Меню", callback_data="nav:home"),
+        InlineKeyboardButton("Назад", callback_data="nav:back"),
+        InlineKeyboardButton("Меню", callback_data="nav:home"),
     ])
     return InlineKeyboardMarkup(rows)
 
@@ -198,31 +198,31 @@ def kb_node_options(cat: Category, node_id: str, node: Node) -> InlineKeyboardMa
 def kb_free_text_node() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("↩️ Назад", callback_data="nav:back"),
-            InlineKeyboardButton("🏠 Меню", callback_data="nav:home"),
+            InlineKeyboardButton("Назад", callback_data="nav:back"),
+            InlineKeyboardButton("Меню", callback_data="nav:home"),
         ],
     ])
 
 
 def kb_post_answer() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📖 Дізнатись детальніше", callback_data="ai:more")],
-        [InlineKeyboardButton("✅ Проблема вирішена", callback_data="ai:done")],
-        [InlineKeyboardButton("↩️ Назад", callback_data="nav:home")],
+        [InlineKeyboardButton("Дізнатись детальніше", callback_data="ai:more")],
+        [InlineKeyboardButton("Проблема вирішена", callback_data="ai:done")],
+        [InlineKeyboardButton("Назад", callback_data="nav:home")],
     ])
 
 
 def kb_profile() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("☕ Змінити модель", callback_data="machine:change")],
-        [InlineKeyboardButton("🗑 Видалити профіль", callback_data="profile:delete")],
-        [InlineKeyboardButton("🏠 Головне меню", callback_data="nav:home")],
+        [InlineKeyboardButton("Змінити модель", callback_data="machine:change")],
+        [InlineKeyboardButton("Видалити профіль", callback_data="profile:delete")],
+        [InlineKeyboardButton("Головне меню", callback_data="nav:home")],
     ])
 
 
 def kb_profile_delete_confirm() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚠️ Так, видалити", callback_data="profile:delete:confirm")],
+        [InlineKeyboardButton("Так, видалити", callback_data="profile:delete:confirm")],
         [InlineKeyboardButton("Скасувати", callback_data="profile:view")],
     ])
 
@@ -263,12 +263,9 @@ async def send_welcome(send_fn, user_id: int, username: str | None) -> None:
     if not state["name"]:
         state["stage"] = "awaiting_name"
         await send_fn(
-            "👋 Привіт! Я CoffeeCare AI.\n"
-            "Допомагаю:\n"
-            "• Діагностувати поломки\n"
-            "• Пояснювати ремонт\n"
-            "• Розшифровувати помилки\n"
-            "• Знаходити інструкції\n\n"
+            "Привіт! Я CoffeeCare AI.\n"
+            "Допомагаю діагностувати поломки, пояснювати ремонт, "
+            "розшифровувати коди помилок і знаходити інструкції.\n\n"
             "Як до вас звертатись?",
             reply_markup=ReplyKeyboardRemove(),
         )
@@ -291,7 +288,7 @@ async def send_home(send_fn, state: dict) -> None:
     state["flow"] = None
     machine_label = _display_machine(state.get("machine"), state.get("machine_display"))
     if state.get("machine") and state["machine"] != "universal":
-        header = f"☕ Машина підключена:\n{machine_label}\n\nЩо сталося?"
+        header = f"Машина підключена: {machine_label}\n\nЩо сталося?"
     else:
         header = "Машина не вказана.\nЩо сталося?"
     await send_fn(header, reply_markup=kb_home())
@@ -331,7 +328,7 @@ async def run_ai(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int,
     """Stream progress edits, run assistant, emit final response."""
     placeholder = await ctx.bot.send_message(
         chat_id=chat_id,
-        text="🔍 Аналізую симптоми…",
+        text="Аналізую симптоми…",
     )
 
     async def edit(text: str) -> None:
@@ -348,9 +345,9 @@ async def run_ai(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int,
 
     async def progress_loop() -> None:
         steps = [
-            (1.2, "🔧 Перевіряю типові проблеми…"),
-            (1.2, "📚 Шукаю в інструкціях…"),
-            (1.5, "✍️ Формую рішення…"),
+            (1.2, "Перевіряю типові проблеми…"),
+            (1.2, "Шукаю в інструкціях…"),
+            (1.5, "Формую рішення…"),
         ]
         for delay, msg in steps:
             try:
@@ -395,8 +392,8 @@ async def run_ai(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int,
     body = result["response"]
     final = (
         f"{body}\n\n"
-        f"🎯 <b>Впевненість AI:</b> {_confidence_label(confidence_score)}\n"
-        f"🔧 <b>Складність ремонту:</b> {leaf.complexity}"
+        f"<b>Впевненість AI:</b> {_confidence_label(confidence_score)}\n"
+        f"<b>Складність ремонту:</b> {leaf.complexity}"
     )
 
     # Replace placeholder with the final answer (or send fresh if too long).
@@ -451,20 +448,20 @@ async def show_profile(send_fn, user_id: int, username: str | None) -> None:
     cat_label = {k: lbl for k, lbl in tree.category_buttons()}
 
     lines = [
-        f"👤 <b>{_html_escape(name)}</b>",
+        f"<b>{_html_escape(name)}</b>",
         "",
-        f"☕ {_html_escape(machine)}",
+        f"Кавомашина: {_html_escape(machine)}",
     ]
     if days is not None and machine_slug and machine_slug != "universal":
-        lines.append(f"📅 Додано: {days} {'день' if days == 1 else 'днів'} тому")
-    lines.append(f"🔧 Діагностик: {diag_count}")
+        lines.append(f"Додано: {days} {'день' if days == 1 else 'днів'} тому")
+    lines.append(f"Діагностик: {diag_count}")
 
     if top_cats:
         lines.append("")
-        lines.append("⚠️ Часті проблеми:")
+        lines.append("Часті проблеми:")
         for cat_key, count in top_cats:
             label = cat_label.get(cat_key, cat_key)
-            lines.append(f"  • {label} — {count}")
+            lines.append(f"  {label} — {count}")
 
     await send_fn("\n".join(lines), parse_mode="HTML", reply_markup=kb_profile())
 
@@ -662,7 +659,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await asyncio.to_thread(_get_user_repo().increment_diagnostic, user_id, cat_key)
             USER_CONVERSATION.pop(user_id, None)
             _reset_flow(state)
-            await query.message.reply_text("✅ Радий допомогти! Якщо потрібно ще — /menu")
+            await query.message.reply_text("Радий допомогти! Якщо потрібно ще — /menu")
             return
 
     if ns == "profile":
@@ -680,11 +677,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 ok = await asyncio.to_thread(_get_user_repo().delete_user, user_id)
                 USER_STATE.pop(user_id, None)
                 USER_CONVERSATION.pop(user_id, None)
-                msg = "🗑 Профіль видалено." if ok else "Профіль не знайдено."
+                msg = "Профіль видалено." if ok else "Профіль не знайдено."
                 await query.message.reply_text(msg + " Напишіть /start для нового початку.")
                 return
             await query.message.reply_text(
-                "⚠️ Видалити профіль повністю? Цю дію не можна скасувати.",
+                "Видалити профіль повністю? Цю дію не можна скасувати.",
                 reply_markup=kb_profile_delete_confirm(),
             )
             return
@@ -799,12 +796,12 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         suggestions = suggest_models(text, n=3, known_brands=known)
         if not suggestions:
             await update.message.reply_text(
-                "😕 Не вдалося визначити бренд.\nСпробуйте написати модель точніше.",
+                "Не вдалося визначити бренд.\nСпробуйте написати модель точніше.",
                 reply_markup=kb_unknown_brand(),
             )
             return
         await update.message.reply_text(
-            "🔍 Знайшов схожі моделі:",
+            "Знайшов схожі моделі:",
             reply_markup=kb_model_suggestions(suggestions),
         )
         return

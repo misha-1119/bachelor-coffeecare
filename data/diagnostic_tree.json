@@ -2,7 +2,7 @@
   "version": 1,
   "categories": {
     "error_code": {
-      "label": "⚠️ Помилка",
+      "label": "Помилка",
       "root": "brand",
       "nodes": {
         "brand": {
@@ -24,7 +24,7 @@
       }
     },
     "coffee": {
-      "label": "☕ Проблема з кавою",
+      "label": "Проблема з кавою",
       "root": "what",
       "nodes": {
         "what": {
@@ -43,14 +43,14 @@
           "prompt": "Коли проблема почалась?",
           "options": [
             {"id": "always", "label": "Завжди так було", "leaf": {"complexity": "Низька", "summary_template": "Проблема постійна з початку — ймовірно налаштування помелу/міцності"}},
-            {"id": "recent", "label": "Нещодавно", "leaf": {"complexity": "Середня", "summary_template": "Проблема з'явилась нещодавно — ймовірно потрібна чистка або заміна зерен"}},
+            {"id": "recent", "label": "Нещодавно", "leaf": {"complexity": "Середня", "summary_template": "Проблема зявилась нещодавно — ймовірно потрібна чистка або заміна зерен"}},
             {"id": "after_clean", "label": "Після чистки/декальцинації", "leaf": {"complexity": "Низька", "summary_template": "Після обслуговування — потрібно промити систему ще раз"}}
           ]
         }
       }
     },
     "leak": {
-      "label": "💧 Вода / протікання",
+      "label": "Вода / протікання",
       "root": "where",
       "nodes": {
         "where": {
@@ -76,7 +76,7 @@
       }
     },
     "cleaning": {
-      "label": "🧽 Чистка",
+      "label": "Чистка",
       "root": "what",
       "nodes": {
         "what": {
@@ -92,7 +92,7 @@
       }
     },
     "milk": {
-      "label": "🥛 Молочна система",
+      "label": "Молочна система",
       "root": "problem",
       "nodes": {
         "problem": {
@@ -108,7 +108,7 @@
       }
     },
     "noise": {
-      "label": "🔊 Дивний звук",
+      "label": "Дивний звук",
       "root": "kind",
       "nodes": {
         "kind": {
@@ -124,7 +124,7 @@
       }
     },
     "other": {
-      "label": "❔ Інше",
+      "label": "Інше",
       "root": "describe",
       "nodes": {
         "describe": {
