@@ -10,6 +10,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY src/ src/
 COPY data/knowledge_base.json data/knowledge_base.json
+COPY data/diagnostic_tree.json data/diagnostic_tree.json
 COPY main.py bot.py ./
 
 # Pre-download liberta-large so cold starts don't re-fetch from HuggingFace
