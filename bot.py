@@ -313,10 +313,11 @@ async def render_node(send_fn, state: dict, cat_key: str, node_id: str) -> None:
 
 
 def _confidence_label(score: float) -> str:
-    pct = int(round(score * 100))
-    if score >= 0.75:
+    clamped = max(0.0, min(1.0, score))
+    pct = int(round(clamped * 100))
+    if clamped >= 0.75:
         tier = "Висока"
-    elif score >= 0.5:
+    elif clamped >= 0.5:
         tier = "Середня"
     else:
         tier = "Низька"
@@ -428,7 +429,72 @@ async def run_ai(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int,
     # Remember context for "more detail" / "done" callbacks.
     conversation["last_complexity"] = leaf.complexity
     conversation["last_category"] = state.get("flow", {}).get("cat") if state.get("flow") else None
+    conversation["last_summary"] = summary_text
+    conversation["last_machine"] = machine
     state["stage"] = "ready"
+
+
+async def _fetch_pdf_chunk(conversation: dict) -> dict | None:
+    """Search Qdrant chunks for the last AI summary; return first hit dict or None.
+
+    Used by 'Дізнатись детальніше' so a PDF source is shown even when the
+    main answer came from kb_qa (no chunk fallback fired).
+    """
+    cached = conversation.get("last_chunk")
+    if cached and cached.get("text"):
+        return cached
+    summary = conversation.get("last_summary")
+    machine = conversation.get("last_machine") or "universal"
+    if not summary:
+        return None
+    assistant = _get_assistant()
+    retriever = assistant.retriever
+    if retriever is None:
+        return None
+    try:
+        from src.retriever import CHUNKS_COLLECTION  # noqa: F401
+        threshold = float(os.getenv("CHUNK_THRESHOLD", "0.45"))
+        hits = await asyncio.to_thread(retriever.search_chunks, summary, machine, 3, None)
+        best = None
+        for h in hits or []:
+            if h.score >= threshold:
+                best = h
+                break
+        if best is None:
+            # Tier 2: same brand only
+            from src.assistant import _resolve_brand
+            brand = _resolve_brand(machine, assistant.known_brands)
+            if brand:
+                try:
+                    bhits = await asyncio.to_thread(
+                        retriever.search_chunks_by_brand, summary, brand, 3, machine, None
+                    )
+                    for h in bhits or []:
+                        if h.score >= threshold:
+                            best = h
+                            break
+                except Exception as exc:
+                    log.warning("chunk-by-brand search failed: %s", exc)
+        if best is None and not assistant.known_brands:
+            try:
+                uhits = await asyncio.to_thread(retriever.search_chunks, summary, None, 3, None)
+                for h in uhits or []:
+                    if h.score >= threshold:
+                        best = h
+                        break
+            except Exception as exc:
+                log.warning("universal chunk search failed: %s", exc)
+        if best is None:
+            return None
+        return {
+            "chunk_id": best.payload.get("chunk_id"),
+            "file": best.payload.get("file", ""),
+            "page_start": best.payload.get("page_start"),
+            "text": (best.payload.get("text") or "").strip(),
+        }
+    except Exception as exc:
+        log.warning("fetch_pdf_chunk failed: %s", exc)
+        return None
 
 
 async def show_profile(send_fn, user_id: int, username: str | None) -> None:
@@ -620,15 +686,18 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         action = parts[1] if len(parts) > 1 else ""
         if action == "more":
             conversation = USER_CONVERSATION.get(user_id, {})
-            last_chunk = conversation.get("last_chunk")
-            if last_chunk and last_chunk.get("text"):
-                text = last_chunk["text"]
-                file = last_chunk.get("file", "")
-                page = last_chunk.get("page_start")
+            # Prefer fresh chunk search → guarantees PDF source if any chunk
+            # passes threshold, regardless of which path the initial answer took.
+            chunk = await _fetch_pdf_chunk(conversation)
+            if chunk and chunk.get("text"):
+                text = chunk["text"]
+                file = chunk.get("file", "")
+                page = chunk.get("page_start")
                 cite = f"\n\n<i>Джерело: {_html_escape(file)}"
                 if page:
                     cite += f", стор. {page}"
                 cite += ".</i>"
+                conversation["last_chunk"] = chunk
                 await _send_long(
                     query.message.reply_text,
                     text + cite,
