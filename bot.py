@@ -434,15 +434,25 @@ async def run_ai(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int,
     state["stage"] = "ready"
 
 
-async def _fetch_pdf_chunk(conversation: dict) -> dict | None:
-    """Search Qdrant chunks for the last AI summary; return first hit dict or None.
+def _chunk_payload(hit) -> dict:
+    return {
+        "chunk_id": hit.payload.get("chunk_id"),
+        "file": hit.payload.get("file", ""),
+        "page_start": hit.payload.get("page_start"),
+        "text": (hit.payload.get("text") or "").strip(),
+        "score": float(hit.score),
+    }
 
-    Used by 'Дізнатись детальніше' so a PDF source is shown even when the
-    main answer came from kb_qa (no chunk fallback fired).
+
+async def _fetch_pdf_chunk(conversation: dict, require_threshold: bool = True) -> dict | None:
+    """Search Qdrant chunks for the last AI summary.
+
+    require_threshold=True  → first hit with score ≥ CHUNK_THRESHOLD (or None).
+    require_threshold=False → top hit regardless of score (best-effort source
+                              for the 'Дізнатись детальніше' citation line).
+
+    Tiers: exact model → same brand → universal.
     """
-    cached = conversation.get("last_chunk")
-    if cached and cached.get("text"):
-        return cached
     summary = conversation.get("last_summary")
     machine = conversation.get("last_machine") or "universal"
     if not summary:
@@ -451,50 +461,49 @@ async def _fetch_pdf_chunk(conversation: dict) -> dict | None:
     retriever = assistant.retriever
     if retriever is None:
         return None
-    try:
-        from src.retriever import CHUNKS_COLLECTION  # noqa: F401
-        threshold = float(os.getenv("CHUNK_THRESHOLD", "0.45"))
-        hits = await asyncio.to_thread(retriever.search_chunks, summary, machine, 3, None)
-        best = None
+
+    threshold = float(os.getenv("CHUNK_THRESHOLD", "0.45")) if require_threshold else -1.0
+
+    def _pick(hits):
         for h in hits or []:
             if h.score >= threshold:
-                best = h
-                break
+                return h
+        return None
+
+    try:
+        from src.assistant import _resolve_brand
+
+        best = _pick(await asyncio.to_thread(retriever.search_chunks, summary, machine, 3, None))
         if best is None:
-            # Tier 2: same brand only
-            from src.assistant import _resolve_brand
             brand = _resolve_brand(machine, assistant.known_brands)
             if brand:
                 try:
-                    bhits = await asyncio.to_thread(
+                    best = _pick(await asyncio.to_thread(
                         retriever.search_chunks_by_brand, summary, brand, 3, machine, None
-                    )
-                    for h in bhits or []:
-                        if h.score >= threshold:
-                            best = h
-                            break
+                    ))
                 except Exception as exc:
                     log.warning("chunk-by-brand search failed: %s", exc)
-        if best is None and not assistant.known_brands:
+        if best is None:
             try:
-                uhits = await asyncio.to_thread(retriever.search_chunks, summary, None, 3, None)
-                for h in uhits or []:
-                    if h.score >= threshold:
-                        best = h
-                        break
+                best = _pick(await asyncio.to_thread(retriever.search_chunks, summary, None, 3, None))
             except Exception as exc:
                 log.warning("universal chunk search failed: %s", exc)
-        if best is None:
-            return None
-        return {
-            "chunk_id": best.payload.get("chunk_id"),
-            "file": best.payload.get("file", ""),
-            "page_start": best.payload.get("page_start"),
-            "text": (best.payload.get("text") or "").strip(),
-        }
+        return _chunk_payload(best) if best is not None else None
     except Exception as exc:
         log.warning("fetch_pdf_chunk failed: %s", exc)
         return None
+
+
+def _format_citation(chunk: dict | None) -> str:
+    if not chunk or not chunk.get("file"):
+        return ""
+    file = chunk["file"]
+    page = chunk.get("page_start")
+    cite = f"\n\n<i>Джерело: {_html_escape(file)}"
+    if page:
+        cite += f", стор. {page}"
+    cite += ".</i>"
+    return cite
 
 
 async def show_profile(send_fn, user_id: int, username: str | None) -> None:
@@ -686,38 +695,35 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         action = parts[1] if len(parts) > 1 else ""
         if action == "more":
             conversation = USER_CONVERSATION.get(user_id, {})
-            # Prefer fresh chunk search → guarantees PDF source if any chunk
-            # passes threshold, regardless of which path the initial answer took.
-            chunk = await _fetch_pdf_chunk(conversation)
-            if chunk and chunk.get("text"):
-                text = chunk["text"]
-                file = chunk.get("file", "")
-                page = chunk.get("page_start")
-                cite = f"\n\n<i>Джерело: {_html_escape(file)}"
-                if page:
-                    cite += f", стор. {page}"
-                cite += ".</i>"
-                conversation["last_chunk"] = chunk
-                await _send_long(
-                    query.message.reply_text,
-                    text + cite,
-                    parse_mode="HTML",
+            # Body: strong chunk hit if available, else the matched KB entry.
+            strong = await _fetch_pdf_chunk(conversation, require_threshold=True)
+            if strong and strong.get("text"):
+                body = strong["text"]
+                source = strong
+                conversation["last_chunk"] = strong
+            else:
+                body = None
+                last_id = conversation.get("last_entry_id")
+                if last_id:
+                    kb = _get_assistant().kb
+                    entry = next((e for e in kb.entries if e.id == last_id), None)
+                    if entry:
+                        body = entry.answer
+                # Best-effort top chunk for the citation line even when the
+                # detail text comes from the KB.
+                source = await _fetch_pdf_chunk(conversation, require_threshold=False)
+
+            if body is None:
+                await query.message.reply_text(
+                    "Поки немає додаткових деталей. Опишіть проблему конкретніше через /menu.",
                     reply_markup=kb_post_answer(),
                 )
                 return
-            last_id = conversation.get("last_entry_id")
-            if last_id:
-                kb = _get_assistant().kb
-                entry = next((e for e in kb.entries if e.id == last_id), None)
-                if entry:
-                    await _send_long(
-                        query.message.reply_text,
-                        entry.answer,
-                        reply_markup=kb_post_answer(),
-                    )
-                    return
-            await query.message.reply_text(
-                "Поки немає додаткових деталей. Опишіть проблему конкретніше через /menu.",
+
+            await _send_long(
+                query.message.reply_text,
+                body + _format_citation(source),
+                parse_mode="HTML",
                 reply_markup=kb_post_answer(),
             )
             return
