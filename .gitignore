@@ -1,7 +1,8 @@
 __pycache__/
 *.pyc
 .env
-.env.local
+.env.*
+!.env.example
 node_modules/
 .convex/
 convex/_generated/

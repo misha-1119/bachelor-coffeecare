@@ -1,96 +1,136 @@
-# CaffeBot
+# Інтелектуальна система чат-бота технічної підтримки користувачів кавомашин (CaffeBot)
 
-Ukrainian-language Telegram chatbot for coffee machine troubleshooting. Users describe a problem in natural language; the bot finds the relevant page in the manufacturer's manual and replies in concise, conversational Ukrainian.
+**Тема бакалаврської роботи:** РОЗРОБЛЕННЯ ІНТЕЛЕКТУАЛЬНОЇ СИСТЕМИ ЧАТ-БОТА ТЕХНІЧНОЇ ПІДТРИМКИ КОРИСТУВАЧІВ КАВОМАШИН
 
-## Stack
+**Автор:** Порохнюк Михайло Володимирович
 
-| Layer | Tech |
-|-------|------|
-| Bot | python-telegram-bot, Railway (Docker) |
-| Vector DB | Qdrant Cloud (eu-central-1), 71,869 PDF chunks |
-| User/KB store | Convex Cloud |
-| Encoder | `Goader/liberta-large` (Ukrainian BERT, 1024-dim, CPU) |
-| LLM (primary) | Groq API — `llama-3.3-70b-versatile`, ~300 tok/s |
-| LLM (fallback) | Lapa v0.1.2 (Gemma-3-12B, Ukrainian) via local Ollama |
-| Local demo | `run_groq.sh` (Groq API) or `run_lapa.sh` (Docker Compose + Ollama) |
+**Науковий керівник:** Колдовський В'ячеслав Васильович, к.е.н., доцент
 
-## How it works
+---
 
-1. **Triage** — instant rule-based replies for greetings, safety, follow-ups.
-2. **Retrieval** — query encoded with liberta-large, searched against 71,869 PDF manual chunks in Qdrant with a 3-tier brand cascade (exact model → same brand → universal). Error-code queries (E01–E20) hit the curated KB directly.
-3. **Generation** — retrieved chunk passed to Groq API (llama-3.3-70b-versatile); reply is 2–4 sentences, conversational Ukrainian, ends with an open question. Falls back to local Lapa via Ollama if Groq is unavailable, then to raw KB text.
+## Опис проєкту
 
-## Run locally
+CaffeBot — україномовний Telegram чат-бот для технічної підтримки користувачів
+кавомашин. Користувач проходить покроковий діагностичний сценарій (категорія
+проблеми → уточнення симптомів), після чого система знаходить релевантну
+сторінку в інструкції виробника та формує стислу відповідь природною
+українською мовою із посиланням на джерело (PDF-мануал).
 
-### Groq mode (recommended — no Docker for LLM)
+Система поєднує:
 
-Requires: Python 3.12+, pip packages, `.env` with `GROQ_API_KEY`.
+- **Семантичний пошук** по 71 869 фрагментах PDF-інструкцій у векторній базі
+  Qdrant (енкодер `Goader/liberta-large` — україномовний BERT);
+- **Базу знань** типових несправностей і кодів помилок (Convex Cloud);
+- **Генеративну модель** (Groq API, `llama-3.3-70b-versatile`; запасний
+  варіант — локальна модель Lapa через Ollama), яка переформульовує знайдену
+  інструкцію у зрозумілу відповідь.
+
+## Стек технологій
+
+| Шар | Технологія |
+|-----|------------|
+| Бот | python-telegram-bot, Railway (Docker) |
+| Векторна БД | Qdrant Cloud, 71 869 фрагментів PDF |
+| База користувачів / знань | Convex Cloud |
+| Енкодер | `Goader/liberta-large` (Ukrainian BERT, 1024-dim, CPU) |
+| LLM (основна) | Groq API — `llama-3.3-70b-versatile` |
+| LLM (запасна) | Lapa v0.1.2 (Gemma-3-12B, українська) через локальний Ollama |
+
+## Як це працює
+
+1. **Онбординг** — бот запитує ім'я та модель кавомашини (нечіткий пошук моделі
+   за каталогом брендів).
+2. **Діагностика** — користувач обирає категорію проблеми (помилка, протікання,
+   чистка, молочна система тощо) і крок за кроком уточнює симптоми за деревом
+   сценаріїв (`data/diagnostic_tree.json`).
+3. **Пошук** — зібрані симптоми кодуються `liberta-large` і шукаються у Qdrant
+   за каскадом із 3 рівнів (точна модель → той самий бренд → універсальні
+   інструкції). Коди помилок звертаються напряму до бази знань.
+4. **Генерація** — знайдений фрагмент передається в Groq API; відповідь — 2–4
+   речення українською. У відповіді показано впевненість AI та складність
+   ремонту, а за кнопкою «Дізнатись детальніше» — цитата з PDF-мануалу
+   (назва файлу та сторінка).
+
+## Встановлення та запуск
+
+Інструкція для розгортання членами екзаменаційної комісії.
+
+### Вимоги
+
+- Python 3.12+
+- Облікові дані у файлі `.env` (скопіювати з `.env.example`)
+
+### Режим Groq (рекомендований — без Docker для LLM)
 
 ```bash
+# 1. Клонувати репозиторій
+git clone <URL-репозиторію>
+cd Diploma_CaffeBot
+
+# 2. Створити .env на основі прикладу та заповнити ключі
 cp .env.example .env
-# fill in: TELEGRAM_BOT_TOKEN, CONVEX_URL, QDRANT_URL, QDRANT_API_KEY, GROQ_API_KEY
+# Заповнити: TELEGRAM_BOT_TOKEN, CONVEX_URL, QDRANT_URL, QDRANT_API_KEY, GROQ_API_KEY
+
+# 3. Встановити залежності
 pip install -r requirements.txt
+
+# 4. Запустити бота
 ./run_groq.sh
 ```
 
-### Lapa mode (offline LLM via Docker Compose)
+Після запуску бот починає опитування Telegram. Відкрийте бота у Telegram і
+надішліть `/start`.
 
-Requires: Docker Desktop, `.env` with credentials (no `GROQ_API_KEY` needed).
+### Режим Lapa (офлайн-LLM через Docker Compose)
+
+Вимоги: Docker Desktop, заповнений `.env` (ключ `GROQ_API_KEY` не потрібен).
 
 ```bash
 ./run_lapa.sh
 ```
 
-First run downloads the Lapa model (~4 GB). Subsequent runs start in seconds.
+Перший запуск завантажує модель Lapa (~4 ГБ); наступні стартують за секунди.
 
-## Environment variables
+## Змінні середовища
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `TELEGRAM_BOT_TOKEN` | yes | BotFather token |
-| `CONVEX_URL` | yes | Convex deployment URL |
-| `QDRANT_URL` | yes | Qdrant Cloud endpoint |
-| `QDRANT_API_KEY` | yes | Qdrant Cloud API key |
-| `GROQ_API_KEY` | yes* | Groq API key (*required for Groq mode) |
-| `GROQ_MODEL` | no | Groq model (default: `llama-3.3-70b-versatile`) |
-| `DISABLE_GROQ` | no | Set to `1` to skip Groq and use Lapa only |
-| `LLAMA_MODEL` | no | Ollama model name (default: lapa-v0.1.2-instruct-GGUF) |
-| `OLLAMA_URL` | no | Ollama endpoint (default: `http://localhost:11434/api/generate`) |
-| `DISABLE_LLAMA` | no | Set to `1` to skip Ollama/Lapa (Groq-only mode) |
-| `CHUNK_THRESHOLD` | no | Min chunk similarity score (default: `0.80`) |
-| `DEBUG_MODE` | no | Set to `1` for verbose per-message debug logs |
+| Змінна | Обов'язкова | Опис |
+|--------|-------------|------|
+| `TELEGRAM_BOT_TOKEN` | так | Токен від @BotFather |
+| `CONVEX_URL` | так | URL розгортання Convex |
+| `QDRANT_URL` | так | Endpoint Qdrant Cloud |
+| `QDRANT_API_KEY` | так | API-ключ Qdrant Cloud |
+| `GROQ_API_KEY` | так* | Ключ Groq API (*для режиму Groq) |
+| `GROQ_MODEL` | ні | Модель Groq (за замовч. `llama-3.3-70b-versatile`) |
+| `DISABLE_GROQ` | ні | `1` — пропустити Groq, лише Lapa |
+| `LLAMA_MODEL` | ні | Назва моделі Ollama (за замовч. lapa-v0.1.2-instruct-GGUF) |
+| `OLLAMA_URL` | ні | Endpoint Ollama (за замовч. `http://localhost:11434/api/generate`) |
+| `DISABLE_LLAMA` | ні | `1` — пропустити Ollama/Lapa (лише Groq) |
+| `CHUNK_THRESHOLD` | ні | Мін. оцінка схожості фрагмента (за замовч. `0.45`) |
+| `DEBUG_MODE` | ні | `1` — детальні логи обробки повідомлень |
 
-## Project structure
+## Структура проєкту
 
 ```
-bot.py                  Telegram handlers, onboarding, user state
-main.py                 Entrypoint (bot / ingest modes)
+bot.py                  Telegram-хендлери, онбординг, діагностичний flow
+main.py                 Точка входу (режими bot / ingest)
 src/
-  assistant.py          Orchestrates triage → retrieval → generation
-  classifier.py         liberta encoder + Qdrant kb_qa search + keyword boost
-  retriever.py          Qdrant client (kb_qa + kb_chunks), brand cascade
-  generator.py          Groq API (primary) → Lapa via Ollama (fallback) → raw text
-  triage.py             Rule-based shortcuts (greeting, safety, follow-ups)
-  knowledge_base.py     Loads KB from Convex (fallback: JSON)
+  assistant.py          Оркестрація: triage → пошук → генерація
+  classifier.py         liberta-енкодер + пошук kb_qa у Qdrant
+  retriever.py          Клієнт Qdrant (kb_qa + kb_chunks), каскад по брендах
+  generator.py          Groq API → Lapa (Ollama) → сирий текст
+  triage.py             Правила-ярлики (привітання, безпека, follow-up)
+  knowledge_base.py     Завантаження бази знань з Convex (fallback: JSON)
+  diagnostic_tree.py    Завантажувач дерева діагностичних сценаріїв
+  brand_matcher.py      Нечіткий пошук моделі кавомашини
+  user_repository.py    Профілі користувачів у Convex
 scripts/
-  ingest_pdfs.py        PDF → chunks → Qdrant kb_chunks
-  ingest_kb.py          KB entries → Qdrant kb_qa
-  upload_vectors.py     Upload pre-encoded vectors to Qdrant Cloud
+  ingest_pdfs.py        PDF → фрагменти → Qdrant kb_chunks
+  ingest_kb.py          Записи бази знань → Qdrant kb_qa
   seed_convex.py        knowledge_base.json → Convex
-  start_ollama_tunnel.sh  Ollama + ngrok tunnel for Railway
 data/
-  knowledge_base.json   355 Q&A entries (137 curated + manual extracts, git-tracked)
-  manuals/              PDF manuals by brand (gitignored, 1.6 GB)
-docs/
-  architecture.md       System diagram + design decisions
-  ai-pipeline.md        Full pipeline flow + chunk cascade + triage rules
-  data-pipeline.md      Ingest scripts + Qdrant Cloud setup
-  knowledge-base.md     KB structure, categories, brand validation
+  knowledge_base.json   Q&A-записи бази знань (відстежується git)
+  diagnostic_tree.json  Дерево діагностичних сценаріїв
+  manuals/              PDF-інструкції за брендами (gitignored)
+convex/                 Схема та функції Convex (users, kb)
+tests/                  Тести flow та пошуку
 ```
-
-## Docs
-
-- [Architecture](docs/architecture.md)
-- [AI Pipeline](docs/ai-pipeline.md)
-- [Data Pipeline](docs/data-pipeline.md)
-- [Knowledge Base](docs/knowledge-base.md)
