@@ -127,6 +127,7 @@ class VectorRetriever:
                 url=qdrant_url,
                 api_key=os.getenv("QDRANT_API_KEY"),
                 timeout=120,
+                prefer_grpc=False,
             )
         else:
             self.db_path = db_path or os.getenv("QDRANT_PATH", DEFAULT_DB_PATH)

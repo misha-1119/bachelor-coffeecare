@@ -473,17 +473,18 @@ async def _fetch_pdf_chunk(conversation: dict, require_threshold: bool = True) -
     try:
         from src.assistant import _resolve_brand
 
+        brand = _resolve_brand(machine, assistant.known_brands)
         best = _pick(await asyncio.to_thread(retriever.search_chunks, summary, machine, 3, None))
-        if best is None:
-            brand = _resolve_brand(machine, assistant.known_brands)
-            if brand:
-                try:
-                    best = _pick(await asyncio.to_thread(
-                        retriever.search_chunks_by_brand, summary, brand, 3, machine, None
-                    ))
-                except Exception as exc:
-                    log.warning("chunk-by-brand search failed: %s", exc)
-        if best is None:
+        if best is None and brand:
+            try:
+                best = _pick(await asyncio.to_thread(
+                    retriever.search_chunks_by_brand, summary, brand, 3, machine, None
+                ))
+            except Exception as exc:
+                log.warning("chunk-by-brand search failed: %s", exc)
+        # Tier 3 (universal): only when user's brand is unknown, otherwise we
+        # would cite a different vendor's manual for the user's machine.
+        if best is None and brand is None:
             try:
                 best = _pick(await asyncio.to_thread(retriever.search_chunks, summary, None, 3, None))
             except Exception as exc:
