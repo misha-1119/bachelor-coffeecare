@@ -6,6 +6,7 @@ across both collections so query embeddings cost one forward pass.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import uuid
@@ -61,6 +62,41 @@ def stable_id(key: str) -> str:
     return str(uuid.uuid5(_UUID_NAMESPACE, key))
 
 
+def _normalize_slug(text: str) -> str:
+    s = text.strip().lower()
+    s = re.sub(r"[^\w\s]", "", s)
+    s = re.sub(r"\s+", "_", s)
+    return s[:60]
+
+
+_INDEX_PATH = Path(__file__).resolve().parent.parent / "data" / "manuals" / "index.json"
+
+
+def _load_known_model_slugs() -> list[str]:
+    """All real Qdrant model slugs from data/manuals/index.json (one per PDF)."""
+    if not _INDEX_PATH.exists():
+        return []
+    try:
+        items = json.loads(_INDEX_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    slugs: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        raw = item.get("slug", "")
+        qslug = _normalize_slug(raw)
+        if qslug and qslug not in seen:
+            seen.add(qslug)
+            slugs.append(qslug)
+    return slugs
+
+
+def _slug_tokens(slug: str) -> set[str]:
+    """Tokenize slug by underscore. Keep all non-empty tokens, including short
+    variant letters like 's', 'b' that distinguish models (Magnifica S vs Evo)."""
+    return {t for t in slug.split("_") if t}
+
+
 @dataclass
 class SearchHit:
     score: float
@@ -98,6 +134,43 @@ class VectorRetriever:
             self.client = QdrantClient(path=self.db_path)
 
         self._cached_encode = lru_cache(maxsize=512)(self._encode_raw)
+        self._known_slugs: list[str] = _load_known_model_slugs()
+        self._known_slug_tokens: list[tuple[str, set[str]]] = [
+            (s, _slug_tokens(s)) for s in self._known_slugs
+        ]
+        if self._known_slugs:
+            print(f"[retriever] known model slugs: {len(self._known_slugs)}")
+
+    def _expand_model(self, model: str | None) -> list[str] | None:
+        """Expand a user-stored model slug to all Qdrant slugs whose tokens
+        cover every user token (exact match, or prefix match when user token is
+        ≥3 chars — handles ingest's dash-stripping like 'ycm-d060'→'ycmd060').
+        Short tokens like 's' require EXACT match so 'magnifica_s' stays
+        distinct from 'magnifica_start'.
+        """
+        if not model or model == "universal":
+            return None
+        user_tokens = _slug_tokens(model)
+        if not user_tokens:
+            return [model]
+        matches: list[str] = []
+        for slug, tokens in self._known_slug_tokens:
+            if self._tokens_cover(user_tokens, tokens):
+                matches.append(slug)
+        return matches or [model]
+
+    @staticmethod
+    def _tokens_cover(user_tokens: set[str], slug_tokens: set[str]) -> bool:
+        for ut in user_tokens:
+            if ut in slug_tokens:
+                continue
+            # Prefix match for alpha tokens ≥2 chars (handles series codes like
+            # 'eq'→'eq300', 'ycm'→'ycmd060'). Digit tokens must match exactly
+            # so '22' doesn't prefix-match '220'. Single letters never prefix.
+            if len(ut) >= 2 and ut.isalpha() and any(st.startswith(ut) for st in slug_tokens):
+                continue
+            return False
+        return True
 
     def _encode_raw(self, text: str) -> tuple[float, ...]:
         vec = self.encoder.encode([text], convert_to_numpy=True, normalize_embeddings=True)[0]
@@ -204,11 +277,12 @@ class VectorRetriever:
     def _model_filter(self, model: str | None):
         from qdrant_client.http import models as qm
 
-        if not model or model == "universal":
+        models_list = self._expand_model(model)
+        if models_list is None:
             return None
         return qm.Filter(
             should=[
-                qm.FieldCondition(key="model", match=qm.MatchValue(value=model)),
+                qm.FieldCondition(key="model", match=qm.MatchAny(any=models_list)),
                 qm.FieldCondition(key="model", match=qm.MatchValue(value="universal")),
             ]
         )
@@ -224,7 +298,8 @@ class VectorRetriever:
         must = [qm.FieldCondition(key="brand", match=qm.MatchValue(value=brand))]
         must_not = []
         if exclude_model and exclude_model != "universal":
-            must_not.append(qm.FieldCondition(key="model", match=qm.MatchValue(value=exclude_model)))
+            excl = self._expand_model(exclude_model) or [exclude_model]
+            must_not.append(qm.FieldCondition(key="model", match=qm.MatchAny(any=excl)))
         if exclude_chunk_ids:
             must_not.append(
                 qm.FieldCondition(key="chunk_id", match=qm.MatchAny(any=list(exclude_chunk_ids)))
@@ -239,9 +314,10 @@ class VectorRetriever:
         from qdrant_client.http import models as qm
 
         should = None
-        if model and model != "universal":
+        models_list = self._expand_model(model)
+        if models_list:
             should = [
-                qm.FieldCondition(key="model", match=qm.MatchValue(value=model)),
+                qm.FieldCondition(key="model", match=qm.MatchAny(any=models_list)),
                 qm.FieldCondition(key="model", match=qm.MatchValue(value="universal")),
             ]
         must_not = None
